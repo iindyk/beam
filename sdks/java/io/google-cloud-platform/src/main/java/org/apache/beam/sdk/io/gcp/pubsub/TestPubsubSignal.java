@@ -223,6 +223,12 @@ public class TestPubsubSignal implements TestRule {
             return null;
           } catch (IOException e) {
             throw new RuntimeException(e);
+          } finally {
+            try {
+              pubsub.deleteSubscription(startSubscriptionPath);
+            } catch (IOException e) {
+              LOG.error(String.format("Leaked PubSub subscription '%s'", startSubscriptionPath));
+            }
           }
         });
   }
@@ -239,6 +245,12 @@ public class TestPubsubSignal implements TestRule {
 
     String result = pollForResultForDuration(resultSubscriptionPath, duration);
 
+    try {
+      pubsub.deleteSubscription(resultSubscriptionPath);
+    } catch (IOException e) {
+      LOG.error(String.format("Leaked PubSub subscription '%s'", resultSubscriptionPath));
+    }
+
     if (!RESULT_SUCCESS_MESSAGE.equals(result)) {
       throw new AssertionError(result);
     }
@@ -253,6 +265,9 @@ public class TestPubsubSignal implements TestRule {
     do {
       try {
         signal = pubsub.pull(DateTime.now().getMillis(), signalSubscriptionPath, 1, false);
+        if (signal.isEmpty()) {
+          continue;
+        }
         pubsub.acknowledge(
             signalSubscriptionPath, signal.stream().map(IncomingMessage::ackId).collect(toList()));
         break;
@@ -267,7 +282,7 @@ public class TestPubsubSignal implements TestRule {
       }
     } while (DateTime.now().isBefore(endPolling));
 
-    if (signal == null) {
+    if (signal == null || signal.isEmpty()) {
       throw new AssertionError(
           String.format(
               "Did not receive signal on %s in %ss",

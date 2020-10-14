@@ -96,6 +96,7 @@ class JobServiceHandle(object):
     self.job_service = job_service
     self.options = options
     self.timeout = options.view_as(PortableOptions).job_server_timeout
+    self.artifact_endpoint = options.view_as(PortableOptions).artifact_endpoint
     self._retain_unknown_options = retain_unknown_options
 
   def submit(self, proto_pipeline):
@@ -105,9 +106,12 @@ class JobServiceHandle(object):
     Submit and run the pipeline defined by `proto_pipeline`.
     """
     prepare_response = self.prepare(proto_pipeline)
+    artifact_endpoint = (
+        self.artifact_endpoint or
+        prepare_response.artifact_staging_endpoint.url)
     self.stage(
         proto_pipeline,
-        prepare_response.artifact_staging_endpoint.url,
+        artifact_endpoint,
         prepare_response.staging_session_token)
     return self.run(prepare_response.preparation_id)
 
@@ -332,6 +336,8 @@ class PortableRunner(runner.PipelineRunner):
                 translations.annotate_downstream_side_inputs,
                 translations.annotate_stateful_dofns_as_roots,
                 translations.fix_side_input_pcoll_coders,
+                translations.eliminate_common_key_with_none,
+                translations.pack_combiners,
                 translations.lift_combiners,
                 translations.expand_sdf,
                 translations.fix_flatten_coders,
@@ -369,6 +375,8 @@ class PortableRunner(runner.PipelineRunner):
     if options.view_as(SetupOptions).sdk_location == 'default':
       options.view_as(SetupOptions).sdk_location = 'container'
 
+    experiments = options.view_as(DebugOptions).experiments or []
+
     # This is needed as we start a worker server if one is requested
     # but none is provided.
     if portable_options.environment_type == 'LOOPBACK':
@@ -376,9 +384,10 @@ class PortableRunner(runner.PipelineRunner):
           DebugOptions).lookup_experiment('use_loopback_process_worker', False)
       portable_options.environment_config, server = (
           worker_pool_main.BeamFnExternalWorkerPoolServicer.start(
-              state_cache_size=sdk_worker_main._get_state_cache_size(options),
+              state_cache_size=
+              sdk_worker_main._get_state_cache_size(experiments),
               data_buffer_time_limit_ms=
-              sdk_worker_main._get_data_buffer_time_limit_ms(options),
+              sdk_worker_main._get_data_buffer_time_limit_ms(experiments),
               use_process=use_loopback_process_worker))
       cleanup_callbacks = [functools.partial(server.stop, 1)]
     else:

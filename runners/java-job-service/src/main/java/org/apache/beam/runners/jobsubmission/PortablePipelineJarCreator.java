@@ -17,6 +17,8 @@
  */
 package org.apache.beam.runners.jobsubmission;
 
+import static org.apache.beam.sdk.util.Preconditions.checkArgumentNotNull;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -26,7 +28,6 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -40,17 +41,14 @@ import org.apache.beam.model.jobmanagement.v1.JobApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.Pipeline;
 import org.apache.beam.runners.core.construction.PipelineOptionsTranslation;
-import org.apache.beam.runners.core.construction.resources.PipelineResources;
 import org.apache.beam.runners.fnexecution.artifact.ArtifactRetrievalService;
 import org.apache.beam.runners.fnexecution.provisioning.JobInfo;
 import org.apache.beam.sdk.io.ClassLoaderFileSystem;
 import org.apache.beam.sdk.metrics.MetricResults;
-import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PortablePipelineOptions;
 import org.apache.beam.vendor.grpc.v1p26p0.com.google.protobuf.MessageOrBuilder;
 import org.apache.beam.vendor.grpc.v1p26p0.com.google.protobuf.util.JsonFormat;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.VisibleForTesting;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.io.ByteStreams;
 import org.apache.commons.compress.utils.IOUtils;
@@ -90,13 +88,14 @@ public class PortablePipelineJarCreator implements PortablePipelineRunner {
             .as(PortablePipelineOptions.class);
 
     final String jobName = jobInfo.jobName();
-    File outputFile = new File(pipelineOptions.getOutputExecutablePath());
+    File outputFile = new File(checkArgumentNotNull(pipelineOptions.getOutputExecutablePath()));
     LOG.info("Creating jar {} for job {}", outputFile.getAbsolutePath(), jobName);
     outputStream =
         new JarOutputStream(new FileOutputStream(outputFile), createManifest(mainClass, jobName));
     outputChannel = Channels.newChannel(outputStream);
     PortablePipelineJarUtils.writeDefaultJobName(outputStream, jobName);
-    writeClassPathResources(mainClass.getClassLoader(), pipelineOptions);
+    copyResourcesFromJar(
+        new JarFile(mainClass.getProtectionDomain().getCodeSource().getLocation().getPath()));
     writeAsJson(
         PipelineOptionsTranslation.toProto(pipelineOptions),
         PortablePipelineJarUtils.getPipelineOptionsUri(jobName));
@@ -131,16 +130,6 @@ public class PortablePipelineJarCreator implements PortablePipelineRunner {
       manifest.getMainAttributes().put(Name.MAIN_CLASS, mainClass.getName());
     }
     return manifest;
-  }
-
-  /** Copy resources from {@code classLoader} to {@link #outputStream}. */
-  private void writeClassPathResources(ClassLoader classLoader, PipelineOptions options)
-      throws IOException {
-    List<String> classPathResources =
-        PipelineResources.detectClassPathResourcesToStage(classLoader, options);
-    Preconditions.checkArgument(
-        classPathResources.size() == 1, "Expected exactly one jar on " + classLoader.toString());
-    copyResourcesFromJar(new JarFile(classPathResources.get(0)));
   }
 
   /** Copy resources from {@code inputJar} to {@link #outputStream}. */

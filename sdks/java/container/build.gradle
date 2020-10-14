@@ -51,8 +51,6 @@ dependencies {
   dockerDependency library.java.kafka_clients
 }
 
-def dockerfileName = project.findProperty('dockerfile') ?: 'Dockerfile'
-
 task copyDockerfileDependencies(type: Copy) {
   from configurations.dockerDependency
   rename "slf4j-api.*", "slf4j-api.jar"
@@ -86,16 +84,22 @@ licenseReport {
   renderers = [new JsonReportRenderer()]
 }
 
+def imageJavaVersion = project.hasProperty('imageJavaVersion') ? project.findProperty('imageJavaVersion') : '8'
 docker {
   name containerImageName(
-          name: project.docker_image_default_repo_prefix + "java_sdk",
+          name: "${project.docker_image_default_repo_prefix}java${imageJavaVersion}_sdk",
           root: project.rootProject.hasProperty(["docker-repository-root"]) ?
                   project.rootProject["docker-repository-root"] :
                   project.docker_image_default_repo_root,
           tag: project.rootProject.hasProperty(["docker-tag"]) ?
                   project.rootProject["docker-tag"] : project.sdk_version)
-  dockerfile project.file("./${dockerfileName}")
+  dockerfile project.file("./Dockerfile")
   files "./build/"
+  buildArgs([
+    'pull_licenses': project.rootProject.hasProperty(["docker-pull-licenses"]) ||
+                     project.rootProject.hasProperty(["isRelease"]),
+    'java_version': imageJavaVersion,
+  ])
 }
 
 if (project.rootProject.hasProperty(["docker-pull-licenses"]) ||
@@ -109,6 +113,13 @@ if (project.rootProject.hasProperty(["docker-pull-licenses"]) ||
     }
   }
   dockerPrepare.dependsOn pullLicenses
+
+  task copyGolangLicenses(type: Copy) {
+    from "${project(':release:go-licenses:java').buildDir}/output"
+    into "build/target/go-licenses"
+    dependsOn ':release:go-licenses:java:createLicenses'
+  }
+  dockerPrepare.dependsOn 'copyGolangLicenses'
 } else {
   task createFile(type: Exec) {
       executable "sh"

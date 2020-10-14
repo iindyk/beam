@@ -20,6 +20,9 @@
 // common properties that are shared among all Jenkins projects.
 // Code in this directory should conform to the Groovy style guide.
 //  http://groovy-lang.org/style-guide.html
+
+import Committers as committers
+
 class CommonJobProperties {
 
   static String checkoutDir = 'src'
@@ -31,7 +34,8 @@ class CommonJobProperties {
       String defaultBranch = 'master',
       int defaultTimeout = 100,
       boolean allowRemotePoll = true,
-      String jenkinsExecutorLabel =  'beam') {
+      String jenkinsExecutorLabel = 'beam',
+      boolean cleanWorkspace = true) {
     // GitHub project.
     context.properties {
       githubProjectUrl('https://github.com/apache/beam/')
@@ -85,19 +89,26 @@ class CommonJobProperties {
         abortBuild()
       }
 
-      // Set SPARK_LOCAL_IP for spark tests.
       environmentVariables {
+        // Set SPARK_LOCAL_IP for spark tests.
         env('SPARK_LOCAL_IP', '127.0.0.1')
+        // Set SETUPTOOLS_USE_DISTUTILS to workaround issue with setuptools
+        // 50.0 and Ubuntu executors (BEAM-10841)
+        env('SETUPTOOLS_USE_DISTUTILS', 'stdlib')
       }
       credentialsBinding {
+        string("CODECOV_TOKEN", "beam-codecov-token")
         string("COVERALLS_REPO_TOKEN", "beam-coveralls-token")
       }
       timestamps()
+      colorizeOutput()
     }
 
-    context.publishers {
-      // Clean after job completes.
-      wsCleanup()
+    if (cleanWorkspace) {
+      context.publishers {
+        // Clean after job completes.
+        wsCleanup()
+      }
     }
   }
 
@@ -114,9 +125,10 @@ class CommonJobProperties {
       githubPullRequest {
         admins(['asfbot'])
         useGitHubHooks()
-        orgWhitelist(['apache'])
-        allowMembersOfWhitelistedOrgsAsAdmin()
         permitAll(prPermitAll)
+        if (!prPermitAll) {
+          userWhitelist(committers.GITHUB_USERNAMES)
+        }
         // prTriggerPhrase is the argument which gets set when we want to allow
         // post-commit builds to run against pending pull requests. This block
         // overrides the default trigger phrase with the new one. Setting this

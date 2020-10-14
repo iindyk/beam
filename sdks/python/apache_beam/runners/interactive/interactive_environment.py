@@ -37,6 +37,7 @@ import apache_beam as beam
 from apache_beam.runners import runner
 from apache_beam.runners.interactive import cache_manager as cache
 from apache_beam.runners.interactive.messaging.interactive_environment_inspector import InteractiveEnvironmentInspector
+from apache_beam.runners.interactive.recording_manager import RecordingManager
 from apache_beam.runners.interactive.utils import register_ipython_log_handler
 from apache_beam.utils.interactive_utils import is_in_ipython
 from apache_beam.utils.interactive_utils import is_in_notebook
@@ -136,6 +137,8 @@ class InteractiveEnvironment(object):
     # PCollection cache for each pipeline. Each key is a stringified user
     # defined pipeline instance's id.
     self._cache_managers = {}
+    # Holds RecordingManagers keyed by pipeline instance id.
+    self._recording_managers = {}
     # Holds class instances, module object, string of module names.
     self._watching_set = set()
     # Holds variables list of (Dict[str, object]).
@@ -199,10 +202,6 @@ class InteractiveEnvironment(object):
           'ipython kernel is not connected any notebook frontend.')
     if self._is_in_notebook:
       self.load_jquery_with_datatable()
-      self.import_html_to_head([
-          'https://raw.githubusercontent.com/PAIR-code/facets/1.0.0/facets-dist'
-          '/facets-jupyter.html'
-      ])
       register_ipython_log_handler()
 
     # A singleton inspector instance to message information of current
@@ -251,18 +250,33 @@ class InteractiveEnvironment(object):
     return self._inspector
 
   def cleanup(self, pipeline=None):
-    """Cleans up cached states for the given pipeline. Cleans up
-    for all pipelines if no specific pipeline is given."""
+    """Cleans up cached states for the given pipeline. Noop if the given
+    pipeline is absent from the environment. Cleans up for all pipelines
+    if no pipeline is specified."""
     if pipeline:
+      from apache_beam.runners.interactive import background_caching_job as bcj
+      bcj.attempt_to_cancel_background_caching_job(pipeline)
+      bcj.attempt_to_stop_test_stream_service(pipeline)
       cache_manager = self.get_cache_manager(pipeline)
       if cache_manager:
         cache_manager.cleanup()
     else:
+      for _, job in self._background_caching_jobs.items():
+        if job:
+          job.cancel()
+      for _, controller in self._test_stream_service_controllers.items():
+        if controller:
+          controller.stop()
       for _, cache_manager in self._cache_managers.items():
-        cache_manager.cleanup()
+        if cache_manager:
+          cache_manager.cleanup()
 
+    self.evict_recording_manager(pipeline)
+    self.evict_background_caching_job(pipeline)
+    self.evict_test_stream_service_controller(pipeline)
     self.evict_computed_pcollections(pipeline)
     self.evict_cached_source_signature(pipeline)
+    self.evict_pipeline_result(pipeline)
 
   def watch(self, watchable):
     """Watches a watchable.
@@ -334,6 +348,57 @@ class InteractiveEnvironment(object):
       return self._cache_managers.pop(str(id(pipeline)), None)
     self._cache_managers.clear()
 
+  def set_recording_manager(self, recording_manager, pipeline):
+    """Sets the recording manager for the given pipeline."""
+    if self.get_recording_manager(pipeline) is recording_manager:
+      # NOOP if setting to the same recording_manager.
+      return
+    self._recording_managers[str(id(pipeline))] = recording_manager
+
+  def get_recording_manager(self, pipeline, create_if_absent=False):
+    """Gets the recording manager for the given pipeline."""
+    recording_manager = self._recording_managers.get(str(id(pipeline)), None)
+    if not recording_manager and create_if_absent:
+      # Get the pipeline variable name for the user. This is useful if the user
+      # has multiple pipelines.
+      pipeline_var = ''
+      for w in self.watching():
+        for var, val in w:
+          if val is pipeline:
+            pipeline_var = var
+            break
+      recording_manager = RecordingManager(pipeline, pipeline_var)
+      self._recording_managers[str(id(pipeline))] = recording_manager
+    return recording_manager
+
+  def evict_recording_manager(self, pipeline):
+    """Evicts the recording manager for the given pipeline.
+
+    This stops the background caching job and clears the cache.
+    Noop if the pipeline is absent from the environment. If no
+    pipeline is specified, evicts for all pipelines.
+    """
+    if not pipeline:
+      for rm in self._recording_managers.values():
+        rm.cancel()
+        rm.clear()
+      self._recording_managers = {}
+      return
+
+    recording_manager = self.get_recording_manager(pipeline)
+    if recording_manager:
+      recording_manager.cancel()
+      recording_manager.clear()
+      del self._recording_managers[str(id(pipeline))]
+
+  def describe_all_recordings(self):
+    """Returns a description of the recording for all watched pipelnes."""
+    return {
+        self.pipeline_id_to_pipeline(pid): rm.describe()
+        for pid,
+        rm in self._recording_managers.items()
+    }
+
   def set_pipeline_result(self, pipeline, result):
     """Sets the pipeline run result. Adds one if absent. Otherwise, replace."""
     assert issubclass(type(pipeline), beam.Pipeline), (
@@ -343,9 +408,13 @@ class InteractiveEnvironment(object):
         'apache_beam.runners.runner.PipelineResult or its subclass')
     self._main_pipeline_results[str(id(pipeline))] = result
 
-  def evict_pipeline_result(self, pipeline):
-    """Evicts the tracking of given pipeline run. Noop if absent."""
-    return self._main_pipeline_results.pop(str(id(pipeline)), None)
+  def evict_pipeline_result(self, pipeline=None):
+    """Evicts the last run result of the given pipeline. Noop if the pipeline
+    is absent from the environment. If no pipeline is specified, evicts for all
+    pipelines."""
+    if pipeline:
+      return self._main_pipeline_results.pop(str(id(pipeline)), None)
+    self._main_pipeline_results.clear()
 
   def pipeline_result(self, pipeline):
     """Gets the pipeline run result. None if absent."""
@@ -364,16 +433,24 @@ class InteractiveEnvironment(object):
     """Gets the background caching job started from the given pipeline."""
     return self._background_caching_jobs.get(str(id(pipeline)), None)
 
+  def evict_background_caching_job(self, pipeline=None):
+    """Evicts the background caching job started from the given pipeline. Noop
+    if the given pipeline is absent from the environment. If no pipeline is
+    specified, evicts for all pipelines."""
+    if pipeline:
+      return self._background_caching_jobs.pop(str(id(pipeline)), None)
+    self._background_caching_jobs.clear()
+
   def set_test_stream_service_controller(self, pipeline, controller):
     """Sets the test stream service controller that has started a gRPC server
-    serving the test stream for any job started from the given user-defined
+    serving the test stream for any job started from the given user defined
     pipeline.
     """
     self._test_stream_service_controllers[str(id(pipeline))] = controller
 
   def get_test_stream_service_controller(self, pipeline):
     """Gets the test stream service controller that has started a gRPC server
-    serving the test stream for any job started from the given user-defined
+    serving the test stream for any job started from the given user defined
     pipeline.
     """
     return self._test_stream_service_controllers.get(str(id(pipeline)), None)
@@ -381,9 +458,12 @@ class InteractiveEnvironment(object):
   def evict_test_stream_service_controller(self, pipeline):
     """Evicts and pops the test stream service controller that has started a
     gRPC server serving the test stream for any job started from the given
-    user-defined pipeline.
+    user defined pipeline. Noop if the given pipeline is absent from the
+    environment. If no pipeline is specified, evicts for all pipelines.
     """
-    return self._test_stream_service_controllers.pop(str(id(pipeline)), None)
+    if pipeline:
+      return self._test_stream_service_controllers.pop(str(id(pipeline)), None)
+    self._test_stream_service_controllers.clear()
 
   def is_terminated(self, pipeline):
     """Queries if the most recent job (by executing the given pipeline) state
@@ -400,13 +480,15 @@ class InteractiveEnvironment(object):
     return self._cached_source_signature.get(str(id(pipeline)), set())
 
   def evict_cached_source_signature(self, pipeline=None):
+    """Evicts the signature generated for each recorded source of the given
+    pipeline. Noop if the given pipeline is absent from the environment. If no
+    pipeline is specified, evicts for all pipelines."""
     if pipeline:
-      self._cached_source_signature.pop(str(id(pipeline)), None)
-    else:
-      self._cached_source_signature.clear()
+      return self._cached_source_signature.pop(str(id(pipeline)), None)
+    self._cached_source_signature.clear()
 
   def track_user_pipelines(self):
-    """Record references to all user-defined pipeline instances watched in
+    """Record references to all user defined pipeline instances watched in
     current environment.
 
     Current static global singleton interactive environment holds references to
@@ -416,11 +498,17 @@ class InteractiveEnvironment(object):
     then handle them differently.
 
     This is invoked every time a PTransform is to be applied if the current
-    code execution is under ipython due to the possibility that any user-defined
+    code execution is under ipython due to the possibility that any user defined
     pipeline can be re-evaluated through notebook cell re-execution at any time.
 
     Each time this is invoked, it will check if there is a cache manager
     already created for each user defined pipeline. If not, create one for it.
+
+    If a pipeline is no longer watched due to re-execution while its
+    PCollections are still in watched scope, the pipeline becomes anonymous but
+    still accessible indirectly through references to its PCollections. This
+    function also clears up internal states for those anonymous pipelines once
+    all their PCollections are anonymous.
     """
     self._tracked_user_pipelines = set()
     for watching in self.watching():
@@ -428,6 +516,18 @@ class InteractiveEnvironment(object):
         if isinstance(val, beam.pipeline.Pipeline):
           self._tracked_user_pipelines.add(val)
           _ = self.get_cache_manager(val, create_if_absent=True)
+          _ = self.get_recording_manager(val, create_if_absent=True)
+    all_tracked_pipeline_ids = set(self._background_caching_jobs.keys()).union(
+        set(self._test_stream_service_controllers.keys()),
+        set(self._cache_managers.keys()),
+        {str(id(pcoll.pipeline))
+         for pcoll in self._computed_pcolls},
+        set(self._cached_source_signature.keys()),
+        set(self._main_pipeline_results.keys()))
+    inspectable_pipelines = self._inspector.inspectable_pipelines
+    for pipeline in all_tracked_pipeline_ids:
+      if pipeline not in inspectable_pipelines:
+        self.cleanup(pipeline)
 
   @property
   def tracked_user_pipelines(self):
@@ -453,9 +553,11 @@ class InteractiveEnvironment(object):
     is specified, evicts for all pipelines.
     """
     if pipeline:
+      discarded = set()
       for pcoll in self._computed_pcolls:
         if pcoll.pipeline is pipeline:
-          self._computed_pcolls.discard(pcoll)
+          discarded.add(pcoll)
+      self._computed_pcolls -= discarded
     else:
       self._computed_pcolls = set()
 

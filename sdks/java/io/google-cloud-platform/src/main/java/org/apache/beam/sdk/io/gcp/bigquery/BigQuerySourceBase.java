@@ -18,8 +18,6 @@
 package org.apache.beam.sdk.io.gcp.bigquery;
 
 import static org.apache.beam.sdk.io.FileSystems.match;
-import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.createJobIdToken;
-import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.getExtractJobId;
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.resolveTempLocation;
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkNotNull;
 
@@ -39,6 +37,7 @@ import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.io.fs.ResourceId;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.Status;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.JobType;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.JobService;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.SerializableFunction;
@@ -77,16 +76,19 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
   private transient List<BoundedSource<T>> cachedSplitResult;
   private SerializableFunction<SchemaAndRecord, T> parseFn;
   private Coder<T> coder;
+  private final boolean useAvroLogicalTypes;
 
   BigQuerySourceBase(
       String stepUuid,
       BigQueryServices bqServices,
       Coder<T> coder,
-      SerializableFunction<SchemaAndRecord, T> parseFn) {
+      SerializableFunction<SchemaAndRecord, T> parseFn,
+      boolean useAvroLogicalTypes) {
     this.stepUuid = checkNotNull(stepUuid, "stepUuid");
     this.bqServices = checkNotNull(bqServices, "bqServices");
     this.coder = checkNotNull(coder, "coder");
     this.parseFn = checkNotNull(parseFn, "parseFn");
+    this.useAvroLogicalTypes = useAvroLogicalTypes;
   }
 
   protected static class ExtractResult {
@@ -120,7 +122,8 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
 
     TableSchema schema = table.getSchema();
     JobService jobService = bqServices.getJobService(bqOptions);
-    String extractJobId = getExtractJobId(createJobIdToken(options.getJobName(), stepUuid));
+    String extractJobId =
+        BigQueryResourceNaming.createJobIdPrefix(options.getJobName(), stepUuid, JobType.EXPORT);
     final String extractDestinationDir =
         resolveTempLocation(bqOptions.getTempLocation(), "BigQueryExtractTemp", stepUuid);
     String bqLocation =
@@ -133,7 +136,8 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
             jobService,
             bqOptions.getProject(),
             extractDestinationDir,
-            bqLocation);
+            bqLocation,
+            useAvroLogicalTypes);
     return new ExtractResult(schema, tempFiles);
   }
 
@@ -189,7 +193,8 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
       JobService jobService,
       String executingProject,
       String extractDestinationDir,
-      String bqLocation)
+      String bqLocation,
+      boolean useAvroLogicalTypes)
       throws InterruptedException, IOException {
 
     JobReference jobRef =
@@ -200,6 +205,7 @@ abstract class BigQuerySourceBase<T> extends BoundedSource<T> {
         new JobConfigurationExtract()
             .setSourceTable(table)
             .setDestinationFormat("AVRO")
+            .setUseAvroLogicalTypes(useAvroLogicalTypes)
             .setDestinationUris(ImmutableList.of(destinationUri));
 
     LOG.info("Starting BigQuery extract job: {}", jobId);

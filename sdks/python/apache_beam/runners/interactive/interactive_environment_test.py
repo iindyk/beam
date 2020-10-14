@@ -28,6 +28,7 @@ import apache_beam as beam
 from apache_beam.runners import runner
 from apache_beam.runners.interactive import cache_manager as cache
 from apache_beam.runners.interactive import interactive_environment as ie
+from apache_beam.runners.interactive.recording_manager import RecordingManager
 
 # TODO(BEAM-8288): clean up the work-around of nose tests using Python2 without
 # unittest.mock module.
@@ -236,15 +237,100 @@ class InteractiveEnvironmentTest(unittest.TestCase):
   @patch(
       'apache_beam.runners.interactive.interactive_environment'
       '.InteractiveEnvironment.cleanup')
-  def test_cleanup_invoked_when_cache_manager_is_evicted(self, mocked_cleanup):
+  def test_track_user_pipeline_cleanup_non_inspectable_pipeline(
+      self, mocked_cleanup):
     ie._interactive_beam_env = None
     ie.new_env()
-    dummy_pipeline = 'dummy'
+    dummy_pipeline_1 = beam.Pipeline()
+    dummy_pipeline_2 = beam.Pipeline()
+    dummy_pipeline_3 = beam.Pipeline()
+    dummy_pipeline_4 = beam.Pipeline()
+    dummy_pcoll = dummy_pipeline_4 | beam.Create([1])
+    dummy_pipeline_5 = beam.Pipeline()
+    dummy_non_inspectable_pipeline = 'dummy'
+    ie.current_env().watch(locals())
+    from apache_beam.runners.interactive.background_caching_job import BackgroundCachingJob
+    ie.current_env().set_background_caching_job(
+        dummy_pipeline_1,
+        BackgroundCachingJob(
+            runner.PipelineResult(runner.PipelineState.DONE), limiters=[]))
+    ie.current_env().set_test_stream_service_controller(dummy_pipeline_2, None)
     ie.current_env().set_cache_manager(
-        cache.FileBasedCacheManager(), dummy_pipeline)
+        cache.FileBasedCacheManager(), dummy_pipeline_3)
+    ie.current_env().mark_pcollection_computed([dummy_pcoll])
+    ie.current_env().set_cached_source_signature(
+        dummy_non_inspectable_pipeline, None)
+    ie.current_env().set_pipeline_result(
+        dummy_pipeline_5, runner.PipelineResult(runner.PipelineState.RUNNING))
     mocked_cleanup.assert_not_called()
-    ie.current_env().evict_cache_manager(dummy_pipeline)
+    ie.current_env().track_user_pipelines()
     mocked_cleanup.assert_called_once()
+
+  def test_evict_pcollections(self):
+    """Tests the evicton logic in the InteractiveEnvironment."""
+
+    # Create two PCollection, one that will be evicted and another that won't.
+    p_to_evict = beam.Pipeline()
+    to_evict = p_to_evict | beam.Create([])
+
+    p_not_evicted = beam.Pipeline()
+    not_evicted = p_not_evicted | beam.Create([])
+
+    # Mark the PCollections as computed because the eviction logic only works
+    # on computed PCollections.
+    ie.current_env().mark_pcollection_computed([to_evict, not_evicted])
+    self.assertSetEqual(
+        ie.current_env().computed_pcollections, {to_evict, not_evicted})
+
+    # Evict the PCollection and then check that the other PCollection is safe.
+    ie.current_env().evict_computed_pcollections(p_to_evict)
+    self.assertSetEqual(ie.current_env().computed_pcollections, {not_evicted})
+
+  def test_set_get_recording_manager(self):
+    ie._interactive_beam_env = None
+    ie.new_env()
+
+    p = beam.Pipeline()
+    rm = RecordingManager(p)
+    ie.current_env().set_recording_manager(rm, p)
+    self.assertIs(rm, ie.current_env().get_recording_manager(p))
+
+  def test_recording_manager_create_if_absent(self):
+    ie._interactive_beam_env = None
+    ie.new_env()
+
+    p = beam.Pipeline()
+    self.assertFalse(ie.current_env().get_recording_manager(p))
+    self.assertTrue(
+        ie.current_env().get_recording_manager(p, create_if_absent=True))
+
+  def test_evict_recording_manager(self):
+    ie._interactive_beam_env = None
+    ie.new_env()
+
+    p = beam.Pipeline()
+    self.assertFalse(ie.current_env().get_recording_manager(p))
+    self.assertTrue(
+        ie.current_env().get_recording_manager(p, create_if_absent=True))
+
+  def test_describe_all_recordings(self):
+    ie._interactive_beam_env = None
+    ie.new_env()
+
+    self.assertFalse(ie.current_env().describe_all_recordings())
+
+    p1 = beam.Pipeline()
+    p2 = beam.Pipeline()
+    ie.current_env().watch(locals())
+    ie.current_env().track_user_pipelines()
+    rm1 = ie.current_env().get_recording_manager(p1, create_if_absent=True)
+    rm2 = ie.current_env().get_recording_manager(p2, create_if_absent=True)
+
+    description = ie.current_env().describe_all_recordings()
+    self.assertTrue(description)
+
+    expected_description = {p1: rm1.describe(), p2: rm2.describe()}
+    self.assertDictEqual(description, expected_description)
 
 
 if __name__ == '__main__':

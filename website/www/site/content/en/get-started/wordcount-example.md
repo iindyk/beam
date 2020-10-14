@@ -387,18 +387,20 @@ python -m apache_beam.examples.wordcount --input YOUR_INPUT_FILE --output counts
 {{< /highlight >}}
 
 {{< highlight class="runner-flink-local" >}}
-Currently, running wordcount.py on Flink requires a full download of the Beam source code.
-See https://beam.apache.org/roadmap/portability/#python-on-flink for more information.
+python -m apache_beam.examples.wordcount --input /path/to/inputfile \
+                                         --output /path/to/write/counts \
+                                         --runner FlinkRunner
 {{< /highlight >}}
 
 {{< highlight class="runner-flink-cluster" >}}
-Currently, running wordcount.py on Flink requires a full download of the Beam source code.
-See https://beam.apache.org/documentation/runners/flink/ for more information.
+# Running Beam Python on a distributed Flink cluster requires additional configuration.
+# See https://beam.apache.org/documentation/runners/flink/ for more information.
 {{< /highlight >}}
 
 {{< highlight class="runner-spark" >}}
-Currently, running wordcount.py on Spark requires a full download of the Beam source code.
-See https://beam.apache.org/roadmap/portability/#python-on-spark for more information.
+python -m apache_beam.examples.wordcount --input /path/to/inputfile \
+                                         --output /path/to/write/counts \
+                                         --runner SparkRunner
 {{< /highlight >}}
 
 {{< highlight class="runner-dataflow" >}}
@@ -904,9 +906,9 @@ or DEBUG significantly increases the amount of logs output.
 
 #### Apache Nemo Runner
 
-When executing your pipeline with the `NemoRunner`, most log messages are printed 
-directly to your local console. You should add `Slf4j` to your class path to make 
-full use of the logs. In order to observe the logs on each of the driver and the 
+When executing your pipeline with the `NemoRunner`, most log messages are printed
+directly to your local console. You should add `Slf4j` to your class path to make
+full use of the logs. In order to observe the logs on each of the driver and the
 executor sides, you should observe the folders created by Apache REEF. For example,
 when running your pipeline through the local runtime, a folder called `REEF_LOCAL_RUNTIME`
 will be created on your work directory, and the logs and the metric information can
@@ -1205,7 +1207,7 @@ each element in the `PCollection`.
 {{< /highlight >}}
 
 {{< highlight py >}}
-beam.Map(AddTimestampFn(timestamp_seconds))
+beam.Map(AddTimestampFn(min_timestamp, max_timestamp))
 {{< /highlight >}}
 
 {{< highlight go >}}
@@ -1247,7 +1249,7 @@ static class AddTimestampFn extends DoFn<String, String> {
 
 {{< highlight py >}}
 class AddTimestampFn(beam.DoFn):
-  
+
   def __init__(self, min_timestamp, max_timestamp):
      self.min_timestamp = min_timestamp
      self.max_timestamp = max_timestamp
@@ -1394,7 +1396,7 @@ To view the full code in Python, see
 
 This example uses an unbounded dataset as input. The code reads Pub/Sub
 messages from a Pub/Sub subscription or topic using
-[`beam.io.ReadStringsFromPubSub`](https://beam.apache.org/releases/pydoc/{{< param release_latest >}}/apache_beam.io.gcp.pubsub.html#apache_beam.io.gcp.pubsub.ReadStringsFromPubSub).
+[`beam.io.ReadFromPubSub`](https://beam.apache.org/releases/pydoc/{{< param release_latest >}}/apache_beam.io.gcp.pubsub.html#apache_beam.io.gcp.pubsub.ReadFromPubSub).
 
 {{< highlight java >}}
   // This example is not currently available for the Beam SDK for Java.
@@ -1403,10 +1405,11 @@ messages from a Pub/Sub subscription or topic using
 {{< highlight py >}}
   # Read from Pub/Sub into a PCollection.
   if known_args.input_subscription:
-    lines = p | beam.io.ReadStringsFromPubSub(
+    data = p | beam.io.ReadFromPubSub(
         subscription=known_args.input_subscription)
   else:
-    lines = p | beam.io.ReadStringsFromPubSub(topic=known_args.input_topic)
+    data = p | beam.io.ReadFromPubSub(topic=known_args.input_topic)
+  lines = data | 'DecodeString' >> beam.Map(lambda d: d.decode('utf-8'))
 {{< /highlight >}}
 
 {{< highlight go >}}
@@ -1422,7 +1425,7 @@ outputs.
 
 This example uses an unbounded `PCollection` and streams the results to
 Google Pub/Sub. The code formats the results and writes them to a Pub/Sub topic
-using [`beam.io.WriteStringsToPubSub`](https://beam.apache.org/releases/pydoc/{{< param release_latest >}}/apache_beam.io.gcp.pubsub.html#apache_beam.io.gcp.pubsub.WriteStringsToPubSub).
+using [`beam.io.WriteToPubSub`](https://beam.apache.org/releases/pydoc/{{< param release_latest >}}/apache_beam.io.gcp.pubsub.html#apache_beam.io.gcp.pubsub.WriteToPubSub).
 
 {{< highlight java >}}
   // This example is not currently available for the Beam SDK for Java.
@@ -1430,7 +1433,9 @@ using [`beam.io.WriteStringsToPubSub`](https://beam.apache.org/releases/pydoc/{{
 
 {{< highlight py >}}
   # Write to Pub/Sub
-  output | beam.io.WriteStringsToPubSub(known_args.output_topic)
+  _ = (output
+    | 'EncodeString' >> Map(lambda s: s.encode('utf-8'))
+    | beam.io.WriteToPubSub(known_args.output_topic))
 {{< /highlight >}}
 
 {{< highlight go >}}

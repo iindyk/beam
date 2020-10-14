@@ -152,8 +152,9 @@ class BigQueryQueryToTableIT(unittest.TestCase):
     # handling the encoding in beam
     for row in table_data:
       row['bytes'] = base64.b64encode(row['bytes']).decode('utf-8')
-    self.bigquery_client.insert_rows(
+    passed, errors = self.bigquery_client.insert_rows(
         self.project, self.dataset_id, NEW_TYPES_INPUT_TABLE, table_data)
+    self.assertTrue(passed, 'Error in BQ setup: %s' % errors)
 
   @attr('IT')
   def test_big_query_legacy_sql(self):
@@ -174,7 +175,6 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         'use_standard_sql': False,
         'wait_until_finish_duration': WAIT_UNTIL_FINISH_DURATION_MS,
         'on_success_matcher': all_of(*pipeline_verifiers),
-        'experiments': 'use_beam_bq_sink',
     }
     options = self.test_pipeline.get_full_options_as_args(**extra_opts)
     big_query_query_to_table_pipeline.run_bq_pipeline(options)
@@ -198,7 +198,6 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         'use_standard_sql': True,
         'wait_until_finish_duration': WAIT_UNTIL_FINISH_DURATION_MS,
         'on_success_matcher': all_of(*pipeline_verifiers),
-        'experiments': 'use_beam_bq_sink',
     }
     options = self.test_pipeline.get_full_options_as_args(**extra_opts)
     big_query_query_to_table_pipeline.run_bq_pipeline(options)
@@ -227,6 +226,7 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         'on_success_matcher': all_of(*pipeline_verifiers),
         'kms_key': kms_key,
         'native': True,
+        'experiments': 'use_legacy_bq_sink',
     }
     options = self.test_pipeline.get_full_options_as_args(**extra_opts)
     big_query_query_to_table_pipeline.run_bq_pipeline(options)
@@ -281,7 +281,6 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         'use_standard_sql': False,
         'wait_until_finish_duration': WAIT_UNTIL_FINISH_DURATION_MS,
         'on_success_matcher': all_of(*pipeline_verifiers),
-        'experiments': 'use_beam_bq_sink',
     }
     options = self.test_pipeline.get_full_options_as_args(**extra_opts)
     big_query_query_to_table_pipeline.run_bq_pipeline(options)
@@ -295,7 +294,9 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         BigqueryMatcher(
             project=self.project,
             query=verify_query,
-            checksum=expected_checksum)
+            checksum=expected_checksum,
+            timeout_secs=30,
+        )
     ]
     self._setup_new_types_env()
     extra_opts = {
@@ -304,8 +305,10 @@ class BigQueryQueryToTableIT(unittest.TestCase):
         'output_schema': NEW_TYPES_OUTPUT_SCHEMA,
         'use_standard_sql': False,
         'native': True,
+        'use_json_exports': True,
         'wait_until_finish_duration': WAIT_UNTIL_FINISH_DURATION_MS,
-        'on_success_matcher': all_of(*pipeline_verifiers)
+        'on_success_matcher': all_of(*pipeline_verifiers),
+        'experiments': 'use_legacy_bq_sink',
     }
     options = self.test_pipeline.get_full_options_as_args(**extra_opts)
     big_query_query_to_table_pipeline.run_bq_pipeline(options)

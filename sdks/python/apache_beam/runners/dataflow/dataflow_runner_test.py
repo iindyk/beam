@@ -250,15 +250,6 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
     self.assertEqual(job_dict[u'steps'][1][u'kind'], u'ParallelDo')
     self.assertEqual(job_dict[u'steps'][2][u'kind'], u'ParallelDo')
 
-  def test_bigquery_read_streaming_fail(self):
-    remote_runner = DataflowRunner()
-    self.default_properties.append("--streaming")
-    with self.assertRaisesRegex(ValueError,
-                                r'source is not currently available'):
-      with Pipeline(remote_runner,
-                    PipelineOptions(self.default_properties)) as p:
-        _ = p | beam.io.Read(beam.io.BigQuerySource('some.table'))
-
   def test_biqquery_read_fn_api_fail(self):
     remote_runner = DataflowRunner()
     for flag in ['beam_fn_api', 'use_unified_worker', 'use_runner_v2']:
@@ -269,7 +260,9 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
           'apache_beam.io.gcp.bigquery.ReadFromBigQuery.*'):
         with Pipeline(remote_runner,
                       PipelineOptions(self.default_properties)) as p:
-          _ = p | beam.io.Read(beam.io.BigQuerySource('some.table'))
+          _ = p | beam.io.Read(
+              beam.io.BigQuerySource(
+                  'some.table', use_dataflow_native_source=True))
 
   def test_remote_runner_display_data(self):
     remote_runner = DataflowRunner()
@@ -323,7 +316,9 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
                          options=PipelineOptions(self.default_properties)) as p:
         # pylint: disable=expression-not-assigned
         p | beam.io.Read(
-            beam.io.BigQuerySource('dataset.faketable')) | beam.GroupByKey()
+            beam.io.BigQuerySource(
+                'dataset.faketable',
+                use_dataflow_native_source=True)) | beam.GroupByKey()
 
   def test_group_by_key_input_visitor_with_valid_inputs(self):
     p = TestPipeline()
@@ -641,7 +636,10 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
     with beam.Pipeline(runner=runner,
                        options=PipelineOptions(self.default_properties)) as p:
       # pylint: disable=expression-not-assigned
-      p | beam.io.Read(beam.io.BigQuerySource('some.table', coder=BytesCoder()))
+      p | beam.io.Read(
+          beam.io.BigQuerySource(
+              'some.table', coder=BytesCoder(),
+              use_dataflow_native_source=True))
 
     self.expect_correct_override(runner.job, u'Read', u'ParallelRead')
 
@@ -698,6 +696,7 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
   def test_write_bigquery_translation(self):
     runner = DataflowRunner()
 
+    self.default_properties.append('--experiments=use_legacy_bq_sink')
     with beam.Pipeline(runner=runner,
                        options=PipelineOptions(self.default_properties)) as p:
       # pylint: disable=expression-not-assigned
@@ -749,12 +748,13 @@ class DataflowRunnerTest(unittest.TestCase, ExtraAssertionsMixin):
     """Tests that WriteToBigQuery cannot have any consumers if replaced."""
     runner = DataflowRunner()
 
-    with self.assertRaises(ValueError):
+    self.default_properties.append('--experiments=use_legacy_bq_sink')
+    with self.assertRaises(Exception):
       with beam.Pipeline(runner=runner,
                          options=PipelineOptions(self.default_properties)) as p:
         # pylint: disable=expression-not-assigned
         out = p | beam.Create([1]) | beam.io.WriteToBigQuery('some.table')
-        out['FailedRows'] | 'MyTransform' >> beam.Map(lambda _: _)
+        out['destination_file_pairs'] | 'MyTransform' >> beam.Map(lambda _: _)
 
 
 class CustomMergingWindowFn(window.WindowFn):

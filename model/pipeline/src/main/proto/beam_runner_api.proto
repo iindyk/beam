@@ -324,6 +324,12 @@ message StandardPTransforms {
 
     // Less well-known. Payload: WriteFilesPayload.
     WRITE_FILES = 3 [(beam_urn) = "beam:transform:write_files:v1"];
+
+    // Payload: PubSubReadPayload.
+    PUBSUB_READ = 4 [(beam_urn) = "beam:transform:pubsub_read:v1"];
+
+    // Payload: PubSubWritePayload.
+    PUBSUB_WRITE = 5 [(beam_urn) = "beam:transform:pubsub_write:v1"];
   }
   // Payload for all of these: CombinePayload
   enum CombineComponents {
@@ -489,6 +495,7 @@ message StateSpec {
     CombiningStateSpec combining_spec = 3;
     MapStateSpec map_spec = 4;
     SetStateSpec set_spec = 5;
+    OrderedListStateSpec ordered_list_spec = 6;
   }
 }
 
@@ -497,6 +504,10 @@ message ReadModifyWriteStateSpec {
 }
 
 message BagStateSpec {
+  string element_coder_id = 1;
+}
+
+message OrderedListStateSpec {
   string element_coder_id = 1;
 }
 
@@ -643,6 +654,46 @@ message WriteFilesPayload {
   bool runner_determined_sharding = 4;
 
   map<string, SideInput> side_inputs = 5;
+}
+
+// Payload used by Google Cloud Pub/Sub read transform.
+// This can be used by runners that wish to override Beam Pub/Sub read transform
+// with a native implementation.
+message PubSubReadPayload {
+
+  // Topic to read from. Exactly one of topic or subscription should be set.
+  string topic = 1;
+
+  // Subscription to read from. Exactly one of topic or subscription should be set.
+  string subscription = 2;
+
+  // Attribute that provides element timestamps.
+  string timestamp_attribute = 3;
+
+  // Attribute to be used for uniquely identifying messages.
+  string id_attribute = 4;
+
+  // If true, reads Pub/Sub payload as well as attributes. If false, reads only the payload.
+  bool with_attributes = 5;
+}
+
+// Payload used by Google Cloud Pub/Sub write transform.
+// This can be used by runners that wish to override Beam Pub/Sub write transform
+// with a native implementation.
+message PubSubWritePayload {
+
+  // Topic to write to.
+  string topic = 1;
+
+  // Attribute that provides element timestamps.
+  string timestamp_attribute = 2;
+
+  // Attribute that uniquely identify messages.
+  string id_attribute = 3;
+
+  // If true, writes Pub/Sub payload as well as attributes. If false, reads only the payload.
+  // TODO(BEAM-10869): consider removing/deprecating this field when fixed.
+  bool with_attributes = 4;
 }
 
 // A coder, the binary format for serialization and deserialization of data in
@@ -855,10 +906,27 @@ message StandardCoders {
     //     BOOLEAN:   beam:coder:bool:v1
     //     BYTES:     beam:coder:bytes:v1
     //   ArrayType:   beam:coder:iterable:v1 (always has a known length)
-    //   MapType:     not yet a standard coder (BEAM-7996)
+    //   MapType:     not a standard coder, specification defined below.
     //   RowType:     beam:coder:row:v1
     //   LogicalType: Uses the coder for its representation.
     //
+    // The MapType is encoded by:
+    //   - An INT32 representing the size of the map (N)
+    //   - Followed by N interleaved keys and values, encoded with their
+    //     corresponding coder.
+    //
+    // Nullable types in container types (ArrayType, MapType) are encoded by:
+    //   - A one byte null indicator, 0x00 for null values, or 0x01 for present
+    //     values.
+    //   - For present values the null indicator is followed by the value
+    //     encoded with it's corresponding coder.
+    // 
+    // Well known logical types:
+    //   beam:logical_type:micros_instant:v1
+    //   - Representation type: ROW<seconds: INT64, micros: INT64>
+    //   - A timestamp without a timezone where seconds + micros represents the
+    //     amount of time since the epoch.
+    // 
     // The payload for RowCoder is an instance of Schema.
     // Components: None
     // Experimental.

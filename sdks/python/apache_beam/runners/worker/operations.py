@@ -37,9 +37,11 @@ from typing import DefaultDict
 from typing import Dict
 from typing import FrozenSet
 from typing import Hashable
+from typing import Iterable
 from typing import Iterator
 from typing import List
-from typing import MutableMapping
+from typing import Mapping
+from typing import NamedTuple
 from typing import Optional
 from typing import Tuple
 from typing import Union
@@ -106,26 +108,43 @@ class ConsumerSet(Receiver):
              step_name,  # type: str
              output_index,
              consumers,  # type: List[Operation]
-             coder
-            ):
+             coder,
+             producer_type_hints
+             ):
     # type: (...) -> ConsumerSet
     if len(consumers) == 1:
       return SingletonConsumerSet(
-          counter_factory, step_name, output_index, consumers, coder)
+          counter_factory,
+          step_name,
+          output_index,
+          consumers,
+          coder,
+          producer_type_hints)
     else:
       return ConsumerSet(
-          counter_factory, step_name, output_index, consumers, coder)
+          counter_factory,
+          step_name,
+          output_index,
+          consumers,
+          coder,
+          producer_type_hints)
 
   def __init__(self,
                counter_factory,
                step_name,  # type: str
                output_index,
                consumers,  # type: List[Operation]
-               coder
-              ):
+               coder,
+               producer_type_hints
+               ):
     self.consumers = consumers
+
     self.opcounter = opcounters.OperationCounters(
-        counter_factory, step_name, coder, output_index)
+        counter_factory,
+        step_name,
+        coder,
+        output_index,
+        producer_type_hints=producer_type_hints)
     # Used in repr.
     self.step_name = step_name
     self.output_index = output_index
@@ -182,11 +201,17 @@ class SingletonConsumerSet(ConsumerSet):
                step_name,
                output_index,
                consumers,  # type: List[Operation]
-               coder
-              ):
+               coder,
+               producer_type_hints
+               ):
     assert len(consumers) == 1
     super(SingletonConsumerSet, self).__init__(
-        counter_factory, step_name, output_index, consumers, coder)
+        counter_factory,
+        step_name,
+        output_index,
+        consumers,
+        coder,
+        producer_type_hints)
     self.consumer = consumers[0]
 
   def receive(self, windowed_value):
@@ -276,7 +301,8 @@ class Operation(object):
                 self.name_context.logging_name(),
                 i,
                 self.consumers[i],
-                coder) for i,
+                coder,
+                self._get_runtime_performance_hints()) for i,
             coder in enumerate(self.spec.output_coders)
         ]
     self.setup_done = True
@@ -382,6 +408,8 @@ class Operation(object):
     return all_monitoring_infos
 
   def user_monitoring_infos(self, transform_id):
+    # type: (str) -> Dict[FrozenSet, metrics_pb2.MonitoringInfo]
+
     """Returns the user MonitoringInfos collected by this operation."""
     return self.metrics_container.to_runner_api_monitoring_infos(transform_id)
 
@@ -452,6 +480,13 @@ class Operation(object):
 
     return '<%s %s>' % (printable_name, ', '.join(printable_fields))
 
+  def _get_runtime_performance_hints(self):
+    # type: () -> Optional[Dict[Optional[str], Tuple[Optional[str], Any]]]
+
+    """Returns any type hints required for performance runtime
+    type-checking."""
+    return None
+
 
 class ReadOperation(Operation):
   def start(self):
@@ -473,19 +508,21 @@ class ImpulseReadOperation(Operation):
       name_context,  # type: Union[str, common.NameContext]
       counter_factory,
       state_sampler,  # type: StateSampler
-      consumers,
-      source,
+      consumers,  # type: Mapping[Any, List[Operation]]
+      source,  # type: iobase.BoundedSource
       output_coder):
     super(ImpulseReadOperation,
           self).__init__(name_context, None, counter_factory, state_sampler)
     self.source = source
+
     self.receivers = [
         ConsumerSet.create(
             self.counter_factory,
             self.name_context.step_name,
             0,
             next(iter(consumers.values())),
-            output_coder)
+            output_coder,
+            self._get_runtime_performance_hints())
     ]
 
   def process(self, unused_impulse):
@@ -518,7 +555,7 @@ class _TaggedReceivers(dict):
 
   def __missing__(self, tag):
     self[tag] = receiver = ConsumerSet(
-        self._counter_factory, self._step_name, tag, [], None)
+        self._counter_factory, self._step_name, tag, [], None, None)
     return receiver
 
   def total_output_bytes(self):
@@ -530,6 +567,16 @@ class _TaggedReceivers(dict):
         mean = (receiver.opcounter.mean_byte_counter.value())[0]
         total += elements * mean
     return total
+
+
+OpInputInfo = NamedTuple(
+    'OpInputInfo',
+    [
+        ('transform_id', str),
+        ('main_input_tag', str),
+        ('main_input_coder', coders.WindowedValueCoder),
+        ('outputs', Iterable[str]),
+    ])
 
 
 class DoOperation(Operation):
@@ -548,7 +595,7 @@ class DoOperation(Operation):
     self.user_state_context = user_state_context
     self.tagged_receivers = None  # type: Optional[_TaggedReceivers]
     # A mapping of timer tags to the input "PCollections" they come in on.
-    self.input_info = None  # type: Optional[Tuple[str, str, coders.WindowedValueCoder, MutableMapping[str, str]]]
+    self.input_info = None  # type: Optional[OpInputInfo]
 
   def _read_side_inputs(self, tags_and_types):
     # type: (...) -> Iterator[apache_sideinputs.SideInputMap]
@@ -671,8 +718,10 @@ class DoOperation(Operation):
       delayed_application = self.dofn_runner.process(o)
       if delayed_application:
         assert self.execution_context is not None
+        # TODO(BEAM-77746): there's disagreement between subclasses
+        #  of DoFnRunner over the return type annotations of process().
         self.execution_context.delayed_applications.append(
-            (self, delayed_application))
+            (self, delayed_application))  # type: ignore[arg-type]
 
   def finalize_bundle(self):
     # type: () -> None
@@ -741,6 +790,13 @@ class DoOperation(Operation):
             pcollection=pcollection_id)
         infos[monitoring_infos.to_key(sampled_byte_count)] = sampled_byte_count
     return infos
+
+  def _get_runtime_performance_hints(self):
+    fns = pickler.loads(self.spec.serialized_fn)
+    if fns and hasattr(fns[0], '_runtime_output_constraints'):
+      return fns[0]._runtime_output_constraints
+
+    return {}
 
 
 class SdfTruncateSizedRestrictions(DoOperation):

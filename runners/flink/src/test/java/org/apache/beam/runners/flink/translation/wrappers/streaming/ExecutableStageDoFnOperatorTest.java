@@ -66,8 +66,10 @@ import org.apache.beam.runners.flink.metrics.DoFnRunnerWithMetricsUpdate;
 import org.apache.beam.runners.flink.streaming.FlinkStateInternalsTest;
 import org.apache.beam.runners.flink.translation.functions.FlinkExecutableStageContextFactory;
 import org.apache.beam.runners.flink.translation.types.CoderTypeInformation;
+import org.apache.beam.runners.fnexecution.control.BundleFinalizationHandler;
 import org.apache.beam.runners.fnexecution.control.BundleProgressHandler;
 import org.apache.beam.runners.fnexecution.control.ExecutableStageContext;
+import org.apache.beam.runners.fnexecution.control.InstructionRequestHandler;
 import org.apache.beam.runners.fnexecution.control.OutputReceiverFactory;
 import org.apache.beam.runners.fnexecution.control.ProcessBundleDescriptors;
 import org.apache.beam.runners.fnexecution.control.RemoteBundle;
@@ -137,6 +139,7 @@ public class ExecutableStageDoFnOperatorTest {
   @Mock private StageBundleFactory stageBundleFactory;
   @Mock private StateRequestHandler stateRequestHandler;
   @Mock private ProcessBundleDescriptors.ExecutableProcessBundleDescriptor processBundleDescriptor;
+  @Mock private InstructionRequestHandler instructionRequestHandler;
 
   // NOTE: ExecutableStage.fromPayload expects exactly one input, so we provide one here. These unit
   // tests in general ignore the executable stage itself and mock around it.
@@ -185,6 +188,7 @@ public class ExecutableStageDoFnOperatorTest {
     when(processBundleDescriptor.getTimerSpecs()).thenReturn(Collections.emptyMap());
     when(processBundleDescriptor.getBagUserStateSpecs()).thenReturn(Collections.emptyMap());
     when(stageBundleFactory.getProcessBundleDescriptor()).thenReturn(processBundleDescriptor);
+    when(stageBundleFactory.getInstructionRequestHandler()).thenReturn(instructionRequestHandler);
   }
 
   @Test
@@ -202,7 +206,7 @@ public class ExecutableStageDoFnOperatorTest {
 
     @SuppressWarnings("unchecked")
     RemoteBundle bundle = Mockito.mock(RemoteBundle.class);
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     @SuppressWarnings("unchecked")
     FnDataReceiver<WindowedValue<?>> receiver = Mockito.mock(FnDataReceiver.class);
@@ -226,7 +230,7 @@ public class ExecutableStageDoFnOperatorTest {
 
     @SuppressWarnings("unchecked")
     RemoteBundle bundle = Mockito.mock(RemoteBundle.class);
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     @SuppressWarnings("unchecked")
     FnDataReceiver<WindowedValue<?>> receiver = Mockito.mock(FnDataReceiver.class);
@@ -264,8 +268,12 @@ public class ExecutableStageDoFnOperatorTest {
     TupleTag<Integer> additionalOutput2 = new TupleTag<>("output-2");
     ImmutableMap<TupleTag<?>, OutputTag<?>> tagsToOutputTags =
         ImmutableMap.<TupleTag<?>, OutputTag<?>>builder()
-            .put(additionalOutput1, new OutputTag<String>(additionalOutput1.getId()) {})
-            .put(additionalOutput2, new OutputTag<String>(additionalOutput2.getId()) {})
+            .put(
+                additionalOutput1,
+                new OutputTag<WindowedValue<String>>(additionalOutput1.getId()) {})
+            .put(
+                additionalOutput2,
+                new OutputTag<WindowedValue<String>>(additionalOutput2.getId()) {})
             .build();
     ImmutableMap<TupleTag<?>, Coder<WindowedValue<?>>> tagsToCoders =
         ImmutableMap.<TupleTag<?>, Coder<WindowedValue<?>>>builder()
@@ -300,7 +308,8 @@ public class ExecutableStageDoFnOperatorTest {
               OutputReceiverFactory receiverFactory,
               TimerReceiverFactory timerReceiverFactory,
               StateRequestHandler stateRequestHandler,
-              BundleProgressHandler progressHandler) {
+              BundleProgressHandler progressHandler,
+              BundleFinalizationHandler finalizationHandler) {
             return new RemoteBundle() {
               @Override
               public String getId() {
@@ -349,6 +358,11 @@ public class ExecutableStageDoFnOperatorTest {
           public ProcessBundleDescriptors.ExecutableProcessBundleDescriptor
               getProcessBundleDescriptor() {
             return processBundleDescriptor;
+          }
+
+          @Override
+          public InstructionRequestHandler getInstructionRequestHandler() {
+            return null;
           }
 
           @Override
@@ -427,7 +441,7 @@ public class ExecutableStageDoFnOperatorTest {
                 .put(KV.of("transform", "timer2"), Mockito.mock(FnDataReceiver.class))
                 .put(KV.of("transform", "timer3"), Mockito.mock(FnDataReceiver.class))
                 .build());
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     testHarness.open();
     assertThat(
@@ -542,11 +556,12 @@ public class ExecutableStageDoFnOperatorTest {
             ImmutableMap.<String, FnDataReceiver<WindowedValue>>builder()
                 .put("input", Mockito.mock(FnDataReceiver.class))
                 .build());
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     testHarness.open();
     testHarness.close();
 
+    verify(stageBundleFactory).getInstructionRequestHandler();
     verify(stageBundleFactory).close();
     verify(stageContext).close();
     verifyNoMoreInteractions(stageBundleFactory);
@@ -584,7 +599,7 @@ public class ExecutableStageDoFnOperatorTest {
             ImmutableMap.<String, FnDataReceiver<WindowedValue>>builder()
                 .put("input", Mockito.mock(FnDataReceiver.class))
                 .build());
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     testHarness.open();
 
@@ -602,8 +617,8 @@ public class ExecutableStageDoFnOperatorTest {
     KeyedStateBackend keyedStateBackend = Mockito.mock(KeyedStateBackend.class);
     Lock stateBackendLock = Mockito.mock(Lock.class);
     StringUtf8Coder keyCoder = StringUtf8Coder.of();
-    GlobalWindow window = GlobalWindow.INSTANCE;
-    GlobalWindow.Coder windowCoder = GlobalWindow.Coder.INSTANCE;
+    IntervalWindow window = new IntervalWindow(new Instant(0), new Instant(10));
+    Coder<IntervalWindow> windowCoder = IntervalWindow.getCoder();
 
     // Test that cleanup timer is set correctly
     ExecutableStageDoFnOperator.CleanupTimer cleanupTimer =
@@ -693,7 +708,7 @@ public class ExecutableStageDoFnOperatorTest {
 
     @SuppressWarnings("unchecked")
     RemoteBundle bundle = Mockito.mock(RemoteBundle.class);
-    when(stageBundleFactory.getBundle(any(), any(), any(), any())).thenReturn(bundle);
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
 
     KV<String, String> timerInputKey = KV.of("transformId", "timerId");
     AtomicBoolean timerInputReceived = new AtomicBoolean();
@@ -836,6 +851,68 @@ public class ExecutableStageDoFnOperatorTest {
 
     testHarness.close();
     verifyNoMoreInteractions(receiver);
+  }
+
+  @Test
+  public void testEnsureStateCleanupOnFinalWatermark() throws Exception {
+    TupleTag<Integer> mainOutput = new TupleTag<>("main-output");
+    DoFnOperator.MultiOutputOutputManagerFactory<Integer> outputManagerFactory =
+        new DoFnOperator.MultiOutputOutputManagerFactory(mainOutput, VoidCoder.of());
+
+    StringUtf8Coder keyCoder = StringUtf8Coder.of();
+
+    WindowingStrategy windowingStrategy = WindowingStrategy.globalDefault();
+    Coder<BoundedWindow> windowCoder = windowingStrategy.getWindowFn().windowCoder();
+
+    KvCoder<String, Integer> kvCoder = KvCoder.of(keyCoder, VarIntCoder.of());
+    ExecutableStageDoFnOperator<Integer, Integer> operator =
+        getOperator(
+            mainOutput,
+            Collections.emptyList(),
+            outputManagerFactory,
+            windowingStrategy,
+            keyCoder,
+            WindowedValue.getFullCoder(kvCoder, windowCoder));
+
+    KeyedOneInputStreamOperatorTestHarness<
+            ByteBuffer, WindowedValue<KV<String, Integer>>, WindowedValue<Integer>>
+        testHarness =
+            new KeyedOneInputStreamOperatorTestHarness(
+                operator,
+                operator.keySelector,
+                new CoderTypeInformation<>(FlinkKeyUtils.ByteBufferCoder.of()));
+
+    RemoteBundle bundle = Mockito.mock(RemoteBundle.class);
+    when(bundle.getInputReceivers())
+        .thenReturn(
+            ImmutableMap.<String, FnDataReceiver<WindowedValue>>builder()
+                .put("input", Mockito.mock(FnDataReceiver.class))
+                .build());
+    when(stageBundleFactory.getBundle(any(), any(), any(), any(), any())).thenReturn(bundle);
+
+    testHarness.open();
+
+    KeyedStateBackend<ByteBuffer> keyedStateBackend = operator.getKeyedStateBackend();
+    ByteBuffer key = FlinkKeyUtils.encodeKey("key1", keyCoder);
+    keyedStateBackend.setCurrentKey(key);
+
+    // create some state which can be cleaned up
+    assertThat(testHarness.numKeyedStateEntries(), is(0));
+    StateNamespace stateNamespace = StateNamespaces.window(windowCoder, GlobalWindow.INSTANCE);
+    BagState<ByteString> state = // State from the SDK Harness is stored as ByteStrings
+        operator.keyedStateInternals.state(
+            stateNamespace, StateTags.bag(stateId, ByteStringCoder.of()));
+    state.add(ByteString.copyFrom("userstate".getBytes(Charsets.UTF_8)));
+    // No timers have been set for cleanup
+    assertThat(testHarness.numEventTimeTimers(), is(0));
+    // State has been created
+    assertThat(testHarness.numKeyedStateEntries(), is(1));
+
+    // Generate final watermark to trigger state cleanup
+    testHarness.processWatermark(
+        new Watermark(BoundedWindow.TIMESTAMP_MAX_VALUE.plus(1).getMillis()));
+
+    assertThat(testHarness.numKeyedStateEntries(), is(0));
   }
 
   @Test

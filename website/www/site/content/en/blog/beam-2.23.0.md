@@ -18,7 +18,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 We are happy to present the new 2.23.0 release of Apache Beam. This release includes both improvements and new functionality.
-See the [download page](/get-started/downloads/#2230-2020-07-16) for this release.
+See the [download page](/get-started/downloads/#2230-2020-07-29) for this release.
 For more information on changes in 2.23.0, check out the
 [detailed release notes](https://issues.apache.org/jira/secure/ReleaseNote.jspa?projectId=12319527&version=12347145).
 
@@ -50,7 +50,7 @@ For more information on changes in 2.23.0, check out the
   `{"foo": "bar", "baz": null}`, whereas an implicit null like `{"foo": "bar"}` would raise an
   exception. Now both JSON strings will yield the same result by default. This behavior can be
   overridden with `RowJson.RowJsonDeserializer#withNullBehavior`.
-* Fixed a bug in `GroupIntoBatches` experimental transform in Python to actually group batches by key. 
+* Fixed a bug in `GroupIntoBatches` experimental transform in Python to actually group batches by key.
   This changes the output type for this transform ([BEAM-6696](https://issues.apache.org/jira/browse/BEAM-6696)).
 
 ## Deprecations

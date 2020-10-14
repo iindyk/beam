@@ -77,12 +77,8 @@ import os
 import sys
 import warnings
 
-if sys.version_info.major == 2 and sys.version_info.minor == 7:
-  warnings.warn(
-      'You are using Apache Beam with Python 2. '
-      'New releases of Apache Beam will soon support Python 3 only.')
-elif sys.version_info.major == 3:
-  if sys.version_info.minor >= 9:
+if sys.version_info.major == 3:
+  if sys.version_info.minor <= 5 or sys.version_info.minor >= 9:
     warnings.warn(
         'This version of Apache Beam has not been sufficiently tested on '
         'Python %s.%s. You may encounter bugs or missing features.' %
@@ -90,9 +86,8 @@ elif sys.version_info.major == 3:
   pass
 else:
   raise RuntimeError(
-      'The Apache Beam SDK for Python is only supported on Python 2.7 or '
-      'Python 3. It is not supported on Python [' + str(sys.version_info) +
-      '].')
+      'The Apache Beam SDK for Python is only supported on Python 3. '
+      'It is not supported on Python [' + str(sys.version_info) + '].')
 
 # pylint: disable=wrong-import-position
 import apache_beam.internal.pickler

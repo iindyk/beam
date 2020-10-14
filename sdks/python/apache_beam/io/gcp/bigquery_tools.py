@@ -63,9 +63,15 @@ from apache_beam.utils import retry
 # Protect against environments where bigquery library is not available.
 # pylint: disable=wrong-import-order, wrong-import-position
 try:
-  from apitools.base.py.exceptions import HttpError
+  from apitools.base.py.exceptions import HttpError, HttpForbiddenError
 except ImportError:
   pass
+
+try:
+  # TODO(pabloem): Remove this workaround after Python 2.7 support ends.
+  from json.decoder import JSONDecodeError
+except ImportError:
+  JSONDecodeError = ValueError
 
 # pylint: enable=wrong-import-order, wrong-import-position
 
@@ -134,7 +140,11 @@ def parse_table_schema_from_json(schema_string):
   Returns:
     A TableSchema of the BigQuery export from either the Query or the Table.
   """
-  json_schema = json.loads(schema_string)
+  try:
+    json_schema = json.loads(schema_string)
+  except JSONDecodeError as e:
+    raise ValueError(
+        'Unable to parse JSON schema: %s - %r' % (schema_string, e))
 
   def _parse_schema_field(field):
     """Parse a single schema field from dictionary.
@@ -290,9 +300,10 @@ class BigQueryWrapper(object):
     """
     Get the location of tables referenced in a query.
 
-    This method returns the location of the first referenced table in the query
-    and depends on the BigQuery service to provide error handling for
-    queries that reference tables in multiple locations.
+    This method returns the location of the first available referenced
+    table for user in the query and depends on the BigQuery service to
+    provide error handling for queries that reference tables in multiple
+    locations.
     """
     reference = bigquery.JobReference(
         jobId=uuid.uuid4().hex, projectId=project_id)
@@ -318,17 +329,25 @@ class BigQueryWrapper(object):
 
     referenced_tables = response.statistics.query.referencedTables
     if referenced_tables:  # Guards against both non-empty and non-None
-      table = referenced_tables[0]
-      location = self.get_table_location(
-          table.projectId, table.datasetId, table.tableId)
-      _LOGGER.info(
-          "Using location %r from table %r referenced by query %s",
-          location,
-          table,
-          query)
-      return location
+      for table in referenced_tables:
+        try:
+          location = self.get_table_location(
+              table.projectId, table.datasetId, table.tableId)
+        except HttpForbiddenError:
+          # Permission access for table (i.e. from authorized_view),
+          # try next one
+          continue
+        _LOGGER.info(
+            "Using location %r from table %r referenced by query %s",
+            location,
+            table,
+            query)
+        return location
 
-    _LOGGER.debug("Query %s does not reference any tables.", query)
+    _LOGGER.debug(
+        "Query %s does not reference any tables or "
+        "you don't have permission to inspect them.",
+        query)
     return None
 
   @retry.with_exponential_backoff(
@@ -361,10 +380,7 @@ class BigQueryWrapper(object):
             jobReference=reference,
         ))
 
-    _LOGGER.info("Inserting job request: %s", request)
-    response = self.client.jobs.Insert(request)
-    _LOGGER.info("Response was %s", response)
-    return response.jobReference
+    return self._start_job(request).jobReference
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -402,8 +418,36 @@ class BigQueryWrapper(object):
             ),
             jobReference=reference,
         ))
-    response = self.client.jobs.Insert(request)
-    return response.jobReference
+    return self._start_job(request).jobReference
+
+  def _start_job(
+      self,
+      request  # type: bigquery.BigqueryJobsInsertRequest
+  ):
+    """Inserts a BigQuery job.
+
+    If the job exists already, it returns it.
+    """
+    try:
+      response = self.client.jobs.Insert(request)
+      _LOGGER.info(
+          "Stated BigQuery job: %s\n "
+          "bq show -j --format=prettyjson --project_id=%s %s",
+          response.jobReference,
+          response.jobReference.projectId,
+          response.jobReference.jobId)
+      return response
+    except HttpError as exn:
+      if exn.status_code == 409:
+        _LOGGER.info(
+            "BigQuery job %s already exists, will not retry inserting it: %s",
+            request.job.jobReference,
+            exn)
+        return request.job
+      else:
+        _LOGGER.info(
+            "Failed to insert job %s: %s", request.job.jobReference, exn)
+        raise
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -437,8 +481,7 @@ class BigQueryWrapper(object):
             ),
             jobReference=reference))
 
-    response = self.client.jobs.Insert(request)
-    return response
+    return self._start_job(request)
 
   def wait_for_bq_job(self, job_reference, sleep_duration_sec=5, max_retries=0):
     """Poll job until it is DONE.
@@ -493,7 +536,13 @@ class BigQueryWrapper(object):
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_timeout_or_quota_issues_filter)
   def _insert_all_rows(
-      self, project_id, dataset_id, table_id, rows, skip_invalid_rows=False):
+      self,
+      project_id,
+      dataset_id,
+      table_id,
+      rows,
+      skip_invalid_rows=False,
+      latency_recoder=None):
     """Calls the insertAll BigQuery API endpoint.
 
     Docs for this BQ call: https://cloud.google.com/bigquery/docs/reference\
@@ -509,8 +558,13 @@ class BigQueryWrapper(object):
             skipInvalidRows=skip_invalid_rows,
             # TODO(silviuc): Should have an option for ignoreUnknownValues?
             rows=rows))
-    response = self.client.tabledata.InsertAll(request)
-    # response.insertErrors is not [] if errors encountered.
+    started_millis = int(time.time() * 1000) if latency_recoder else None
+    try:
+      response = self.client.tabledata.InsertAll(request)
+      # response.insertErrors is not [] if errors encountered.
+    finally:
+      if latency_recoder:
+        latency_recoder.record(int(time.time() * 1000) - started_millis)
     return not response.insertErrors, response.insertErrors
 
   @retry.with_exponential_backoff(
@@ -542,6 +596,16 @@ class BigQueryWrapper(object):
       table_id,
       schema,
       additional_parameters=None):
+
+    valid_tablename = re.match(r'^[\w]{1,1024}$', table_id, re.ASCII)
+    if not valid_tablename:
+      raise ValueError(
+          'Invalid BigQuery table name: %s \n'
+          'A table name in BigQuery must contain only letters (a-z, A-Z), '
+          'numbers (0-9), or underscores (_) and be up to 1024 characters:\n'
+          'See https://cloud.google.com/bigquery/docs/tables#table_naming' %
+          table_id)
+
     additional_parameters = additional_parameters or {}
     table = bigquery.Table(
         tableReference=bigquery.TableReference(
@@ -754,12 +818,12 @@ class BigQueryWrapper(object):
             ),
             jobReference=job_reference,
         ))
-    response = self.client.jobs.Insert(request)
-    return response.jobReference
+    return self._start_job(request).jobReference
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
-      retry_filter=retry.retry_on_server_errors_and_timeout_filter)
+      retry_filter=retry.
+      retry_if_valid_input_but_server_error_and_timeout_filter)
   def get_or_create_table(
       self,
       project_id,
@@ -916,7 +980,8 @@ class BigQueryWrapper(object):
       table_id,
       rows,
       insert_ids=None,
-      skip_invalid_rows=False):
+      skip_invalid_rows=False,
+      latency_recoder=None):
     """Inserts rows into the specified table.
 
     Args:
@@ -927,6 +992,9 @@ class BigQueryWrapper(object):
         each key in it is the name of a field.
       skip_invalid_rows: If there are rows with insertion errors, whether they
         should be skipped, and all others should be inserted successfully.
+      latency_recoder: The object that records request-to-response latencies.
+        The object should provide `record(int)` method to be invoked with
+        milliseconds latency values.
 
     Returns:
       A tuple (bool, errors). If first element is False then the second element
@@ -947,7 +1015,8 @@ class BigQueryWrapper(object):
           bigquery.TableDataInsertAllRequest.RowsValueListEntry(
               insertId=insert_id, json=json_row))
     result, errors = self._insert_all_rows(
-        project_id, dataset_id, table_id, final_rows, skip_invalid_rows)
+        project_id, dataset_id, table_id, final_rows, skip_invalid_rows,
+        latency_recoder)
     return result, errors
 
   def _convert_to_json_row(self, row):
@@ -1366,7 +1435,11 @@ class AppendDestinationsFn(DoFn):
   Experimental; no backwards compatibility guarantees.
   """
   def __init__(self, destination):
+    self._display_destination = destination
     self.destination = AppendDestinationsFn._get_table_fn(destination)
+
+  def display_data(self):
+    return {'destination': str(self._display_destination)}
 
   @staticmethod
   def _value_provider_or_static_val(elm):
@@ -1481,3 +1554,21 @@ bigquery_v2_messages.TableSchema):
   dict_table_schema = get_dict_table_schema(schema)
   return bigquery_avro_tools.get_record_schema_from_dict_table_schema(
       "root", dict_table_schema)
+
+
+class BigQueryJobTypes:
+  EXPORT = 'EXPORT'
+  COPY = 'COPY'
+  LOAD = 'LOAD'
+  QUERY = 'QUERY'
+
+
+def generate_bq_job_name(job_name, step_id, job_type, random=None):
+  from apache_beam.io.gcp.bigquery import BQ_JOB_NAME_TEMPLATE
+  random = ("_%s" % random) if random else ""
+  return str.format(
+      BQ_JOB_NAME_TEMPLATE,
+      job_type=job_type,
+      job_id=job_name.replace("-", ""),
+      step_id=step_id,
+      random=random)

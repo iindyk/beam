@@ -127,7 +127,7 @@ class InteractiveRunner(runners.PipelineRunner):
     return self._underlying_runner.apply(transform, pvalueish, options)
 
   def run_pipeline(self, pipeline, options):
-    if not ie.current_env().options.enable_capture_replay:
+    if not ie.current_env().options.enable_recording_replay:
       capture_control.evict_captured_data()
     if self._force_compute:
       ie.current_env().evict_computed_pcollections()
@@ -152,7 +152,11 @@ class InteractiveRunner(runners.PipelineRunner):
               user_pipeline)):
         streaming_cache_manager = ie.current_env().get_cache_manager(
             user_pipeline)
-        if streaming_cache_manager:
+
+        # Only make the server if it doesn't exist already.
+        if (streaming_cache_manager and
+            not ie.current_env().get_test_stream_service_controller(
+                user_pipeline)):
 
           def exception_handler(e):
             _LOGGER.error(str(e))

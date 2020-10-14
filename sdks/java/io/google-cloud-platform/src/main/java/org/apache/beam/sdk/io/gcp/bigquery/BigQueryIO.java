@@ -17,10 +17,8 @@
  */
 package org.apache.beam.sdk.io.gcp.bigquery;
 
-import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.createJobIdToken;
-import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.createTempTableReference;
-import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.getExtractJobId;
 import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.resolveTempLocation;
+import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.createTempTableReference;
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
 
@@ -38,10 +36,10 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
 import com.google.api.services.bigquery.model.TimePartitioning;
 import com.google.auto.value.AutoValue;
-import com.google.cloud.bigquery.storage.v1beta1.ReadOptions.TableReadOptions;
-import com.google.cloud.bigquery.storage.v1beta1.Storage.CreateReadSessionRequest;
-import com.google.cloud.bigquery.storage.v1beta1.Storage.ReadSession;
-import com.google.cloud.bigquery.storage.v1beta1.Storage.Stream;
+import com.google.cloud.bigquery.storage.v1.CreateReadSessionRequest;
+import com.google.cloud.bigquery.storage.v1.DataFormat;
+import com.google.cloud.bigquery.storage.v1.ReadSession;
+import com.google.cloud.bigquery.storage.v1.ReadStream;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
@@ -77,6 +75,7 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.TableSchemaToJsonSche
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.TableSpecToTableRef;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryHelpers.TimePartitioningToJson;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.TypedRead.Method;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryResourceNaming.JobType;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.DatasetService;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.JobService;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.StorageClient;
@@ -457,6 +456,22 @@ import org.slf4j.LoggerFactory;
  * </a> for security and permission related information specific to BigQuery.
  */
 public class BigQueryIO {
+
+  /**
+   * Template for BigQuery jobs created by BigQueryIO. This template is: {@code
+   * "beam_bq_job_{TYPE}_{JOB_ID}_{STEP}_{RANDOM}"}, where:
+   *
+   * <ul>
+   *   <li>{@code TYPE} represents the BigQuery job type (e.g. extract / copy / load / query)
+   *   <li>{@code JOB_ID} is the Beam job name.
+   *   <li>{@code STEP} is a UUID representing the the Dataflow step that created the BQ job.
+   *   <li>{@code RANDOM} is a random string.
+   * </ul>
+   *
+   * <p><b>NOTE:</b> This job name template does not have backwards compatibility guarantees.
+   */
+  public static final String BIGQUERY_JOB_TEMPLATE = "beam_bq_job_{TYPE}_{JOB_ID}_{STEP}_{RANDOM}";
+
   private static final Logger LOG = LoggerFactory.getLogger(BigQueryIO.class);
 
   /** Singleton instance of the JSON factory used to read and write JSON formatted rows. */
@@ -562,6 +577,7 @@ public class BigQueryIO {
         .setBigQueryServices(new BigQueryServicesImpl())
         .setParseFn(parseFn)
         .setMethod(Method.DEFAULT)
+        .setUseAvroLogicalTypes(false)
         .build();
   }
 
@@ -607,7 +623,7 @@ public class BigQueryIO {
       return this.inner.getQuery();
     }
 
-    Read withTestServices(BigQueryServices testServices) {
+    public Read withTestServices(BigQueryServices testServices) {
       return new Read(this.inner.withTestServices(testServices));
     }
 
@@ -751,14 +767,6 @@ public class BigQueryIO {
 
       abstract Builder<T> setMethod(Method method);
 
-      /**
-       * @deprecated Use {@link #setSelectedFields(ValueProvider)} and {@link
-       *     #setRowRestriction(ValueProvider)} instead.
-       */
-      @Deprecated
-      @Experimental(Kind.SOURCE_SINK)
-      abstract Builder<T> setReadOptions(TableReadOptions readOptions);
-
       abstract Builder<T> setSelectedFields(ValueProvider<List<String>> selectedFields);
 
       abstract Builder<T> setRowRestriction(ValueProvider<String> rowRestriction);
@@ -779,6 +787,8 @@ public class BigQueryIO {
 
       @Experimental(Kind.SCHEMAS)
       abstract Builder<T> setFromBeamRowFn(FromBeamRowFunction<T> fromRowFn);
+
+      abstract Builder<T> setUseAvroLogicalTypes(Boolean useAvroLogicalTypes);
     }
 
     abstract @Nullable ValueProvider<String> getJsonTableRef();
@@ -805,11 +815,6 @@ public class BigQueryIO {
 
     abstract Method getMethod();
 
-    /** @deprecated Use {@link #getSelectedFields()} and {@link #getRowRestriction()} instead. */
-    @Deprecated
-    @Experimental(Kind.SOURCE_SINK)
-    abstract @Nullable TableReadOptions getReadOptions();
-
     abstract @Nullable ValueProvider<List<String>> getSelectedFields();
 
     abstract @Nullable ValueProvider<String> getRowRestriction();
@@ -829,6 +834,8 @@ public class BigQueryIO {
     @Nullable
     @Experimental(Kind.SCHEMAS)
     abstract FromBeamRowFunction<T> getFromBeamRowFn();
+
+    abstract Boolean getUseAvroLogicalTypes();
 
     /**
      * An enumeration type for the priority of a query.
@@ -969,8 +976,6 @@ public class BigQueryIO {
           // If the user provided a temp dataset, check if the dataset exists before launching the
           // query
           if (getQueryTempDataset() != null) {
-            Optional<String> queryTempDataset = Optional.ofNullable(getQueryTempDataset());
-
             // The temp table is only used for dataset and project id validation, not for table name
             // validation
             TableReference tempTable =
@@ -1033,11 +1038,6 @@ public class BigQueryIO {
       }
 
       checkArgument(
-          getReadOptions() == null,
-          "Invalid BigQueryIO.Read: Specifies table read options, "
-              + "which only applies when using Method.DIRECT_READ");
-
-      checkArgument(
           getSelectedFields() == null,
           "Invalid BigQueryIO.Read: Specifies selected fields, "
               + "which only applies when using Method.DIRECT_READ");
@@ -1061,7 +1061,8 @@ public class BigQueryIO {
         rows =
             p.apply(
                 org.apache.beam.sdk.io.Read.from(
-                    sourceDef.toSource(staticJobUuid, coder, getParseFn())));
+                    sourceDef.toSource(
+                        staticJobUuid, coder, getParseFn(), getUseAvroLogicalTypes())));
       } else {
         // Create a singleton job ID token at execution time.
         jobIdTokenCollection =
@@ -1088,7 +1089,8 @@ public class BigQueryIO {
                           public void processElement(ProcessContext c) throws Exception {
                             String jobUuid = c.element();
                             BigQuerySourceBase<T> source =
-                                sourceDef.toSource(jobUuid, coder, getParseFn());
+                                sourceDef.toSource(
+                                    jobUuid, coder, getParseFn(), getUseAvroLogicalTypes());
                             BigQueryOptions options =
                                 c.getPipelineOptions().as(BigQueryOptions.class);
                             ExtractResult res = source.extractFiles(options);
@@ -1120,7 +1122,8 @@ public class BigQueryIO {
                                         c.sideInput(schemaView), TableSchema.class);
                                 String jobUuid = c.sideInput(jobIdTokenView);
                                 BigQuerySourceBase<T> source =
-                                    sourceDef.toSource(jobUuid, coder, getParseFn());
+                                    sourceDef.toSource(
+                                        jobUuid, coder, getParseFn(), getUseAvroLogicalTypes());
                                 List<BoundedSource<T>> sources =
                                     source.createSources(
                                         ImmutableList.of(
@@ -1153,7 +1156,9 @@ public class BigQueryIO {
               JobReference jobRef =
                   new JobReference()
                       .setProjectId(executingProject)
-                      .setJobId(getExtractJobId(createJobIdToken(bqOptions.getJobName(), jobUuid)));
+                      .setJobId(
+                          BigQueryResourceNaming.createJobIdPrefix(
+                              bqOptions.getJobName(), jobUuid, JobType.EXPORT));
 
               Job extractJob = getBigQueryServices().getJobService(bqOptions).getJob(jobRef);
 
@@ -1190,18 +1195,12 @@ public class BigQueryIO {
             org.apache.beam.sdk.io.Read.from(
                 BigQueryStorageTableSource.create(
                     tableProvider,
-                    getReadOptions(),
                     getSelectedFields(),
                     getRowRestriction(),
                     getParseFn(),
                     outputCoder,
                     getBigQueryServices())));
       }
-
-      checkArgument(
-          getReadOptions() == null,
-          "Invalid BigQueryIO.Read: Specifies table read options, "
-              + "which only applies when reading from a table");
 
       checkArgument(
           getSelectedFields() == null,
@@ -1252,7 +1251,7 @@ public class BigQueryIO {
 
         jobIdTokenView = jobIdTokenCollection.apply("ViewId", View.asSingleton());
 
-        TupleTag<Stream> streamsTag = new TupleTag<>();
+        TupleTag<ReadStream> readStreamsTag = new TupleTag<>();
         TupleTag<ReadSession> readSessionTag = new TupleTag<>();
         TupleTag<String> tableSchemaTag = new TupleTag<>();
 
@@ -1260,7 +1259,7 @@ public class BigQueryIO {
             jobIdTokenCollection.apply(
                 "RunQueryJob",
                 ParDo.of(
-                        new DoFn<String, Stream>() {
+                        new DoFn<String, ReadStream>() {
                           @ProcessElement
                           public void processElement(ProcessContext c) throws Exception {
                             BigQueryOptions options =
@@ -1277,11 +1276,15 @@ public class BigQueryIO {
                             // let the BigQuery storage server pick the number of streams.
                             CreateReadSessionRequest request =
                                 CreateReadSessionRequest.newBuilder()
-                                    .setParent("projects/" + options.getProject())
-                                    .setTableReference(
-                                        BigQueryHelpers.toTableRefProto(
-                                            queryResultTable.getTableReference()))
-                                    .setRequestedStreams(0)
+                                    .setParent(
+                                        BigQueryHelpers.toProjectResourceName(options.getProject()))
+                                    .setReadSession(
+                                        ReadSession.newBuilder()
+                                            .setTable(
+                                                BigQueryHelpers.toTableResourceName(
+                                                    queryResultTable.getTableReference()))
+                                            .setDataFormat(DataFormat.AVRO))
+                                    .setMaxStreamCount(0)
                                     .build();
 
                             ReadSession readSession;
@@ -1290,8 +1293,8 @@ public class BigQueryIO {
                               readSession = storageClient.createReadSession(request);
                             }
 
-                            for (Stream stream : readSession.getStreamsList()) {
-                              c.output(stream);
+                            for (ReadStream readStream : readSession.getStreamsList()) {
+                              c.output(readStream);
                             }
 
                             c.output(readSessionTag, readSession);
@@ -1301,9 +1304,9 @@ public class BigQueryIO {
                           }
                         })
                     .withOutputTags(
-                        streamsTag, TupleTagList.of(readSessionTag).and(tableSchemaTag)));
+                        readStreamsTag, TupleTagList.of(readSessionTag).and(tableSchemaTag)));
 
-        tuple.get(streamsTag).setCoder(ProtoCoder.of(Stream.class));
+        tuple.get(readStreamsTag).setCoder(ProtoCoder.of(ReadStream.class));
         tuple.get(readSessionTag).setCoder(ProtoCoder.of(ReadSession.class));
         tuple.get(tableSchemaTag).setCoder(StringUtf8Coder.of());
 
@@ -1314,23 +1317,23 @@ public class BigQueryIO {
 
         rows =
             tuple
-                .get(streamsTag)
+                .get(readStreamsTag)
                 .apply(Reshuffle.viaRandomKey())
                 .apply(
                     ParDo.of(
-                            new DoFn<Stream, T>() {
+                            new DoFn<ReadStream, T>() {
                               @ProcessElement
                               public void processElement(ProcessContext c) throws Exception {
                                 ReadSession readSession = c.sideInput(readSessionView);
                                 TableSchema tableSchema =
                                     BigQueryHelpers.fromJsonString(
                                         c.sideInput(tableSchemaView), TableSchema.class);
-                                Stream stream = c.element();
+                                ReadStream readStream = c.element();
 
                                 BigQueryStorageStreamSource<T> streamSource =
                                     BigQueryStorageStreamSource.create(
                                         readSession,
-                                        stream,
+                                        readStream,
                                         tableSchema,
                                         getParseFn(),
                                         outputCoder,
@@ -1362,7 +1365,8 @@ public class BigQueryIO {
               TableReference tempTable =
                   createTempTableReference(
                       options.getProject(),
-                      createJobIdToken(options.getJobName(), jobUuid),
+                      BigQueryResourceNaming.createJobIdPrefix(
+                          options.getJobName(), jobUuid, JobType.QUERY),
                       queryTempDataset);
 
               DatasetService datasetService = getBigQueryServices().getDatasetService(options);
@@ -1403,16 +1407,6 @@ public class BigQueryIO {
     private void ensureFromNotCalledYet() {
       checkState(
           getJsonTableRef() == null && getQuery() == null, "from() or fromQuery() already called");
-    }
-
-    private void ensureReadOptionsNotSet() {
-      checkState(getReadOptions() == null, "withReadOptions() already called");
-    }
-
-    private void ensureReadOptionsFieldsNotSet() {
-      checkState(
-          getSelectedFields() == null && getRowRestriction() == null,
-          "setSelectedFields() or setRowRestriction already called");
     }
 
     /** See {@link Read#getTableProvider()}. */
@@ -1542,17 +1536,6 @@ public class BigQueryIO {
       return toBuilder().setMethod(method).build();
     }
 
-    /**
-     * @deprecated Use {@link #withSelectedFields(List)} and {@link #withRowRestriction(String)}
-     *     instead.
-     */
-    @Deprecated
-    @Experimental(Kind.SOURCE_SINK)
-    public TypedRead<T> withReadOptions(TableReadOptions readOptions) {
-      ensureReadOptionsFieldsNotSet();
-      return toBuilder().setReadOptions(readOptions).build();
-    }
-
     /** See {@link #withSelectedFields(ValueProvider)}. */
     public TypedRead<T> withSelectedFields(List<String> selectedFields) {
       return withSelectedFields(StaticValueProvider.of(selectedFields));
@@ -1565,7 +1548,6 @@ public class BigQueryIO {
      * <p>Requires {@link Method#DIRECT_READ}. Not compatible with {@link #fromQuery(String)}.
      */
     public TypedRead<T> withSelectedFields(ValueProvider<List<String>> selectedFields) {
-      ensureReadOptionsNotSet();
       return toBuilder().setSelectedFields(selectedFields).build();
     }
 
@@ -1582,7 +1564,6 @@ public class BigQueryIO {
      * <p>Requires {@link Method#DIRECT_READ}. Not compatible with {@link #fromQuery(String)}.
      */
     public TypedRead<T> withRowRestriction(ValueProvider<String> rowRestriction) {
-      ensureReadOptionsNotSet();
       return toBuilder().setRowRestriction(rowRestriction).build();
     }
 
@@ -1591,8 +1572,12 @@ public class BigQueryIO {
     }
 
     @VisibleForTesting
-    TypedRead<T> withTestServices(BigQueryServices testServices) {
+    public TypedRead<T> withTestServices(BigQueryServices testServices) {
       return toBuilder().setBigQueryServices(testServices).build();
+    }
+
+    public TypedRead<T> useAvroLogicalTypes() {
+      return toBuilder().setUseAvroLogicalTypes(true).build();
     }
   }
 

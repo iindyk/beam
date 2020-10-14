@@ -15,15 +15,24 @@
 # limitations under the License.
 #
 
-"""This module has all statistic related transforms."""
+"""This module has all statistic related transforms.
+This ApproximateUnique class will be deprecated [1]. PLease look into using
+HLLCount in the zetasketch extension module [2].
+[1] https://lists.apache.org/thread.html/501605df5027567099b81f18c080469661fb426
+4a002615fa1510502%40%3Cdev.beam.apache.org%3E
+[2] https://beam.apache.org/releases/javadoc/2.16.0/org/apache/beam/sdk/extensio
+ns/zetasketch/HllCount.html
+"""
 
 # pytype: skip-file
 
 from __future__ import absolute_import
 from __future__ import division
 
+import hashlib
 import heapq
 import itertools
+import logging
 import math
 import sys
 import typing
@@ -46,6 +55,31 @@ K = typing.TypeVar('K')
 V = typing.TypeVar('V')
 
 
+def _get_default_hash_fn():
+  """Returns either murmurhash or md5 based on installation."""
+  try:
+    import mmh3  # pylint: disable=import-error
+
+    def _mmh3_hash(value):
+      # mmh3.hash64 returns two 64-bit unsigned integers
+      return mmh3.hash64(value, seed=0, signed=False)[0]
+
+    return _mmh3_hash
+
+  except ImportError:
+    logging.warning(
+        'Couldn\'t find murmurhash. Install mmh3 for a faster implementation of'
+        'ApproximateUnique.')
+
+    def _md5_hash(value):
+      # md5 is a 128-bit hash, so we truncate the hexdigest (string of 32
+      # hexadecimal digits) to 16 digits and convert to int to get the 64-bit
+      # integer fingerprint.
+      return int(hashlib.md5(value).hexdigest()[:16], 16)
+
+    return _md5_hash
+
+
 class ApproximateUnique(object):
   """
   Hashes input elements and uses those to extrapolate the size of the entire
@@ -66,7 +100,6 @@ class ApproximateUnique(object):
   def parse_input_params(size=None, error=None):
     """
     Check if input params are valid and return sample size.
-
     :param size: an int not smaller than 16, which we would use to estimate
       number of unique values.
     :param error: max estimation error, which is a float between 0.01 and 0.50.
@@ -97,7 +130,6 @@ class ApproximateUnique(object):
   def _get_sample_size_from_est_error(est_err):
     """
     :return: sample size
-
     Calculate sample size from estimation error
     """
     #math.ceil in python2.7 returns a float, while it returns an int in python3.
@@ -137,11 +169,12 @@ class _LargestUnique(object):
   An object to keep samples and calculate sample hash space. It is an
   accumulator of a combine function.
   """
-  _HASH_SPACE_SIZE = 2.0 * sys.maxsize
+  # We use unsigned 64-bit integer hashes.
+  _HASH_SPACE_SIZE = 2.0**64
 
   def __init__(self, sample_size):
     self._sample_size = sample_size
-    self._min_hash = sys.maxsize
+    self._min_hash = 2.0**64
     self._sample_heap = []
     self._sample_set = set()
 
@@ -149,7 +182,6 @@ class _LargestUnique(object):
     """
     :param an element from pcoll.
     :return: boolean type whether the value is in the heap
-
     Adds a value to the heap, returning whether the value is (large enough to
     be) in the heap.
     """
@@ -166,13 +198,11 @@ class _LargestUnique(object):
         self._min_hash = self._sample_heap[0]
       elif element < self._min_hash:
         self._min_hash = element
-
     return True
 
   def get_estimate(self):
     """
     :return: estimation count of unique values
-
     If heap size is smaller than sample size, just return heap size.
     Otherwise, takes into account the possibility of hash collisions,
     which become more likely than not for 2^32 distinct elements.
@@ -180,24 +210,20 @@ class _LargestUnique(object):
     log(1 - sample_size/sample_space) / log(1 - 1/sample_space) ~ sample_size
     and hence estimate ~ sample_size * hash_space / sample_space
     as one would expect.
-
     Given sample_size / sample_space = est / hash_space
     est = sample_size * hash_space / sample_space
-
     Given above sample_size approximate,
     est = log1p(-sample_size/sample_space) / log1p(-1/sample_space)
       * hash_space / sample_space
     """
-
     if len(self._sample_heap) < self._sample_size:
       return len(self._sample_heap)
     else:
-      sample_space_size = sys.maxsize - 1.0 * self._min_hash
+      sample_space_size = self._HASH_SPACE_SIZE - 1.0 * self._min_hash
       est = (
           math.log1p(-self._sample_size / sample_space_size) /
           math.log1p(-1 / sample_space_size) * self._HASH_SPACE_SIZE /
           sample_space_size)
-
       return round(est)
 
 
@@ -208,17 +234,22 @@ class ApproximateUniqueCombineFn(CombineFn):
   """
   def __init__(self, sample_size, coder):
     self._sample_size = sample_size
+    coder = coders.typecoders.registry.verify_deterministic(
+        coder, 'ApproximateUniqueCombineFn')
+
     self._coder = coder
+    self._hash_fn = _get_default_hash_fn()
 
   def create_accumulator(self, *args, **kwargs):
     return _LargestUnique(self._sample_size)
 
   def add_input(self, accumulator, element, *args, **kwargs):
     try:
-      accumulator.add(hash(self._coder.encode(element)))
+      hashed_value = self._hash_fn(self._coder.encode(element))
+      accumulator.add(hashed_value)
       return accumulator
     except Exception as e:
-      raise RuntimeError("Runtime exception: %s", e)
+      raise RuntimeError("Runtime exception: %s" % e)
 
   # created an issue https://issues.apache.org/jira/browse/BEAM-7285 to speed up
   # merge process.
@@ -242,16 +273,11 @@ class ApproximateQuantiles(object):
   """
   PTransform for getting the idea of data distribution using approximate N-tile
   (e.g. quartiles, percentiles etc.) either globally or per-key.
-
   Examples:
-
     in: list(range(101)), num_quantiles=5
-
     out: [0, 25, 50, 75, 100]
-
     in: [(i, 1 if i<10 else 1e-5) for i in range(101)], num_quantiles=5,
       weighted=True
-
     out: [0, 2, 5, 7, 100]
   """
   @staticmethod
@@ -273,7 +299,6 @@ class ApproximateQuantiles(object):
     """
     PTransform takes PCollection and returns a list whose single value is
     approximate N-tiles of the input collection globally.
-
     Args:
       num_quantiles: number of elements in the resulting quantiles values list.
       key: (optional) Key is  a mapping of elements to a comparable key, similar
@@ -314,7 +339,6 @@ class ApproximateQuantiles(object):
     PTransform takes PCollection of KV and returns a list based on each key
     whose single value is list of approximate N-tiles of the input element of
     the key.
-
     Args:
       num_quantiles: number of elements in the resulting quantiles values list.
       key: (optional) Key is  a mapping of elements to a comparable key, similar
@@ -420,25 +444,19 @@ class ApproximateQuantilesCombineFn(CombineFn):
   minimum value item of the list, the intermediate values (n-tiles) and the
   maximum value item of the list, in the sort order provided via key (similar
   to the key argument of Python's sorting methods).
-
   If there are fewer values to combine than the number of quantile
   (num_quantiles), then the resulting list will contain all the values being
   combined, in sorted order.
-
   If no `key` is provided, then the results are sorted in the natural order.
-
   To evaluate the quantiles, we use the "New Algorithm" described here:
-
   [MRL98] Manku, Rajagopalan & Lindsay, "Approximate Medians and other
   Quantiles in One Pass and with Limited Memory", Proc. 1998 ACM SIGMOD,
   Vol 27, No 2, p 426-435, June 1998.
   http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.6.6513&rep=rep1
   &type=pdf
-
   The default error bound is (1 / N) for uniformly distributed data and
   min(1e-2, 1 / N) for weighted case, though in practice the accuracy tends to
   be much better.
-
   Args:
     num_quantiles: Number of quantiles to produce. It is the size of the final
       output list, including the mininum and maximum value items.
@@ -511,7 +529,6 @@ class ApproximateQuantilesCombineFn(CombineFn):
     """
     Creates an approximate quantiles combiner with the given key and desired
     number of quantiles.
-
     Args:
       num_quantiles: Number of quantiles to produce. It is the size of the
         final output list, including the mininum and maximum value items.

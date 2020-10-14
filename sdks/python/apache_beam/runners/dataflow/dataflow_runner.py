@@ -430,6 +430,11 @@ class DataflowRunner(PipelineRunner):
                 components.coders[windowing_strategy.window_coder_id].spec.urn,
                 windowing_strategy.window_fn.urn))
 
+  def _adjust_pipeline_for_dataflow_v2(self, pipeline):
+    # Dataflow runner requires a KV type for GBK inputs, hence we enforce that
+    # here.
+    pipeline.visit(self.group_by_key_input_visitor())
+
   def run_pipeline(self, pipeline, options):
     """Remotely executes entire pipeline or parts reachable from node."""
     # Label goog-dataflow-notebook if job is started from notebook.
@@ -473,10 +478,23 @@ class DataflowRunner(PipelineRunner):
 
     use_fnapi = apiclient._use_fnapi(options)
     from apache_beam.transforms import environments
-    self._default_environment = (
-        environments.DockerEnvironment.from_container_image(
-            apiclient.get_container_image_from_options(options),
-            artifacts=environments.python_sdk_dependencies(options)))
+    if options.view_as(SetupOptions).prebuild_sdk_container_engine:
+      # if prebuild_sdk_container_engine is specified we will build a new sdk
+      # container image with dependencies pre-installed and use that image,
+      # instead of using the inferred default container image.
+      self._default_environment = (
+          environments.DockerEnvironment.from_options(options))
+      options.view_as(WorkerOptions).worker_harness_container_image = (
+          self._default_environment.container_image)
+    else:
+      self._default_environment = (
+          environments.DockerEnvironment.from_container_image(
+              apiclient.get_container_image_from_options(options),
+              artifacts=environments.python_sdk_dependencies(options)))
+
+    # This has to be performed before pipeline proto is constructed to make sure
+    # that the changes are reflected in the portable job submission path.
+    self._adjust_pipeline_for_dataflow_v2(pipeline)
 
     # Snapshot the pipeline in a portable proto.
     self.proto_pipeline, self.proto_context = pipeline.to_runner_api(
@@ -488,6 +506,8 @@ class DataflowRunner(PipelineRunner):
       # Cross language transform require using a pipeline object constructed
       # from the full pipeline proto to make sure that expanded version of
       # external transforms are reflected in the Pipeline job graph.
+      # TODO(chamikara): remove following pipeline and pipeline proto recreation
+      # after portable job submission path is fully in place.
       from apache_beam import Pipeline
       pipeline = Pipeline.from_runner_api(
           self.proto_pipeline,
@@ -529,14 +549,20 @@ class DataflowRunner(PipelineRunner):
     if google_cloud_options.enable_streaming_engine:
       debug_options.add_experiment("enable_windmill_service")
       debug_options.add_experiment("enable_streaming_engine")
+    elif (apiclient._use_fnapi(options) and
+          apiclient._use_unified_worker(options) and
+          options.view_as(StandardOptions).streaming):
+      debug_options.add_experiment("enable_windmill_service")
+      debug_options.add_experiment("enable_streaming_engine")
     else:
       if (debug_options.lookup_experiment("enable_windmill_service") or
           debug_options.lookup_experiment("enable_streaming_engine")):
         raise ValueError(
             """Streaming engine both disabled and enabled:
-        enable_streaming_engine flag is not set, but enable_windmill_service
+        --enable_streaming_engine flag is not set, but
+        enable_windmill_service
         and/or enable_streaming_engine experiments are present.
-        It is recommended you only set the enable_streaming_engine flag.""")
+        It is recommended you only set the --enable_streaming_engine flag.""")
 
     dataflow_worker_jar = getattr(worker_options, 'dataflow_worker_jar', None)
     if dataflow_worker_jar is not None:
@@ -557,12 +583,9 @@ class DataflowRunner(PipelineRunner):
 
     self.job = apiclient.Job(options, self.proto_pipeline)
 
-    # Dataflow runner requires a KV type for GBK inputs, hence we enforce that
-    # here.
-    pipeline.visit(self.group_by_key_input_visitor())
-
-    # Dataflow runner requires output type of the Flatten to be the same as the
-    # inputs, hence we enforce that here.
+    # Dataflow Runner v1 requires output type of the Flatten to be the same as
+    # the inputs, hence we enforce that here. Dataflow Runner v2 does not
+    # require this.
     pipeline.visit(self.flatten_input_visitor())
 
     # Trigger a traversal of all reachable nodes.
@@ -592,15 +615,13 @@ class DataflowRunner(PipelineRunner):
     return result
 
   def _maybe_add_unified_worker_missing_options(self, options):
-    # set default beam_fn_api and use_beam_bq_sink experiment if use unified
+    # set default beam_fn_api experiment if use unified
     # worker experiment flag exists, no-op otherwise.
     debug_options = options.view_as(DebugOptions)
     from apache_beam.runners.dataflow.internal import apiclient
     if apiclient._use_unified_worker(options):
       if not debug_options.lookup_experiment('beam_fn_api'):
         debug_options.add_experiment('beam_fn_api')
-      if not debug_options.lookup_experiment('use_beam_bq_sink'):
-        debug_options.add_experiment('use_beam_bq_sink')
 
   def _get_typehint_based_encoding(self, typehint, window_coder):
     """Returns an encoding based on a typehint object."""

@@ -154,7 +154,7 @@ class WriteRename extends DoFn<Iterable<KV<TableDestination, String>>, Void> {
 
     // Make sure each destination table gets a unique job id.
     String jobIdPrefix =
-        BigQueryHelpers.createJobId(
+        BigQueryResourceNaming.createJobIdWithDestination(
             c.sideInput(jobIdToken), finalTableDestination, -1, c.pane().getIndex());
 
     BigQueryHelpers.PendingJob retryJob =
@@ -210,7 +210,7 @@ class WriteRename extends DoFn<Iterable<KV<TableDestination, String>>, Void> {
               try {
                 jobService.startCopyJob(jobRef, copyConfig);
               } catch (IOException | InterruptedException e) {
-                LOG.warn("Copy job {} failed with {}", jobRef, e);
+                LOG.warn("Copy job {} failed.", jobRef, e);
                 throw new RuntimeException(e);
               }
               return null;

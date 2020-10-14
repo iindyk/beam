@@ -60,6 +60,9 @@ import org.apache.beam.runners.core.construction.graph.UserStateReference;
 import org.apache.beam.runners.flink.translation.functions.FlinkExecutableStageContextFactory;
 import org.apache.beam.runners.flink.translation.functions.FlinkStreamingSideInputHandlerFactory;
 import org.apache.beam.runners.flink.translation.types.CoderTypeSerializer;
+import org.apache.beam.runners.fnexecution.control.BundleFinalizationHandler;
+import org.apache.beam.runners.fnexecution.control.BundleFinalizationHandlers;
+import org.apache.beam.runners.fnexecution.control.BundleFinalizationHandlers.InMemoryFinalizer;
 import org.apache.beam.runners.fnexecution.control.BundleProgressHandler;
 import org.apache.beam.runners.fnexecution.control.ExecutableStageContext;
 import org.apache.beam.runners.fnexecution.control.OutputReceiverFactory;
@@ -81,6 +84,7 @@ import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.DoFnSchemaInformation;
 import org.apache.beam.sdk.transforms.join.RawUnionValue;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
+import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.KV;
@@ -133,6 +137,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
   private transient ExecutableStageContext stageContext;
   private transient StateRequestHandler stateRequestHandler;
   private transient BundleProgressHandler progressHandler;
+  private transient InMemoryFinalizer finalizationHandler;
   private transient StageBundleFactory stageBundleFactory;
   private transient ExecutableStage executableStage;
   private transient SdkHarnessDoFnRunner<InputT, OutputT> sdkHarnessRunner;
@@ -227,6 +232,9 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
             }
           }
         };
+    finalizationHandler =
+        BundleFinalizationHandlers.inMemoryFinalizer(
+            stageBundleFactory.getInstructionRequestHandler());
 
     minEventTimeTimerTimestampInCurrentBundle = Long.MAX_VALUE;
     minEventTimeTimerTimestampInLastBundle = Long.MAX_VALUE;
@@ -235,6 +243,12 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
 
     // This will call {@code createWrappingDoFnRunner} which needs the above dependencies.
     super.open();
+  }
+
+  @Override
+  public final void notifyCheckpointComplete(long checkpointId) throws Exception {
+    finalizationHandler.finalizeAllOutstandingBundles();
+    super.notifyCheckpointComplete(checkpointId);
   }
 
   private StateRequestHandler getStateRequestHandler(ExecutableStage executableStage) {
@@ -526,6 +540,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
             stageBundleFactory,
             stateRequestHandler,
             progressHandler,
+            finalizationHandler,
             outputManager,
             outputMap,
             (Coder<BoundedWindow>) windowingStrategy.getWindowFn().windowCoder(),
@@ -634,6 +649,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
     private final StageBundleFactory stageBundleFactory;
     private final StateRequestHandler stateRequestHandler;
     private final BundleProgressHandler progressHandler;
+    private final BundleFinalizationHandler finalizationHandler;
     private final BufferedOutputManager<OutputT> outputManager;
     private final Map<String, TupleTag<?>> outputMap;
 
@@ -657,6 +673,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
         StageBundleFactory stageBundleFactory,
         StateRequestHandler stateRequestHandler,
         BundleProgressHandler progressHandler,
+        BundleFinalizationHandler finalizationHandler,
         BufferedOutputManager<OutputT> outputManager,
         Map<String, TupleTag<?>> outputMap,
         Coder<BoundedWindow> windowCoder,
@@ -667,6 +684,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
       this.stageBundleFactory = stageBundleFactory;
       this.stateRequestHandler = stateRequestHandler;
       this.progressHandler = progressHandler;
+      this.finalizationHandler = finalizationHandler;
       this.outputManager = outputManager;
       this.outputMap = outputMap;
       this.timerRegistration = timerRegistration;
@@ -693,7 +711,11 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
       try {
         remoteBundle =
             stageBundleFactory.getBundle(
-                receiverFactory, timerReceiverFactory, stateRequestHandler, progressHandler);
+                receiverFactory,
+                timerReceiverFactory,
+                stateRequestHandler,
+                progressHandler,
+                finalizationHandler);
         mainInputReceiver = Iterables.getOnlyElement(remoteBundle.getInputReceivers().values());
       } catch (Exception e) {
         throw new RuntimeException("Failed to start remote bundle", e);
@@ -902,6 +924,12 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
     @Override
     public void setForWindow(InputT input, BoundedWindow window) {
       Preconditions.checkNotNull(input, "Null input passed to CleanupTimer");
+      if (window.equals(GlobalWindow.INSTANCE)) {
+        // Skip setting a cleanup timer for the global window as these timers
+        // lead to potentially unbounded state growth in the runner, depending on key cardinality.
+        // Cleanup for global window will be performed upon arrival of the final watermark.
+        return;
+      }
       // needs to match the encoding in prepareStateBackend for state request handler
       final ByteBuffer key = FlinkKeyUtils.encodeKey(((KV) input).getKey(), keyCoder);
       // Ensure the state backend is not concurrently accessed by the state requests

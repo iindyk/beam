@@ -152,19 +152,24 @@ func decoderForSingleTypeReflect(t reflect.Type) func(reflect.Value, io.Reader) 
 				return nil
 			}
 		}
-		decf := decoderForSingleTypeReflect(t.Elem())
-		sdec := iterableDecoderForSlice(t, decf)
-		return func(rv reflect.Value, r io.Reader) error {
-			return sdec(rv, r)
-		}
+		decf := containerDecoderForType(t.Elem())
+		return iterableDecoderForSlice(t, decf)
 	case reflect.Array:
-		decf := decoderForSingleTypeReflect(t.Elem())
-		sdec := iterableDecoderForArray(t, decf)
-		return func(rv reflect.Value, r io.Reader) error {
-			return sdec(rv, r)
-		}
+		decf := containerDecoderForType(t.Elem())
+		return iterableDecoderForArray(t, decf)
+	case reflect.Map:
+		decK := containerDecoderForType(t.Key())
+		decV := containerDecoderForType(t.Elem())
+		return mapDecoder(t, decK, decV)
 	}
 	panic(fmt.Sprintf("unimplemented type to decode: %v", t))
+}
+
+func containerDecoderForType(t reflect.Type) func(reflect.Value, io.Reader) error {
+	if t.Kind() == reflect.Ptr {
+		return containerNilDecoder(decoderForSingleTypeReflect(t.Elem()))
+	}
+	return decoderForSingleTypeReflect(t)
 }
 
 type typeDecoderReflect struct {
@@ -270,16 +275,28 @@ func encoderForSingleTypeReflect(t reflect.Type) func(reflect.Value, io.Writer) 
 				return EncodeBytes(rv.Bytes(), w)
 			}
 		}
-		encf := encoderForSingleTypeReflect(t.Elem())
+		encf := containerEncoderForType(t.Elem())
 		return iterableEncoder(t, encf)
 	case reflect.Array:
-		encf := encoderForSingleTypeReflect(t.Elem())
+		encf := containerEncoderForType(t.Elem())
 		return iterableEncoder(t, encf)
+	case reflect.Map:
+		encK := containerEncoderForType(t.Key())
+		encV := containerEncoderForType(t.Elem())
+		return mapEncoder(t, encK, encV)
 	}
 	panic(fmt.Sprintf("unimplemented type to encode: %v", t))
 }
 
+func containerEncoderForType(t reflect.Type) func(reflect.Value, io.Writer) error {
+	if t.Kind() == reflect.Ptr {
+		return containerNilEncoder(encoderForSingleTypeReflect(t.Elem()))
+	}
+	return encoderForSingleTypeReflect(t)
+}
+
 type typeEncoderReflect struct {
+	debug  []string
 	fields []func(reflect.Value, io.Writer) error
 }
 
@@ -287,6 +304,7 @@ type typeEncoderReflect struct {
 func encoderForStructReflect(t reflect.Type) func(reflect.Value, io.Writer) error {
 	var coder typeEncoderReflect
 	for i := 0; i < t.NumField(); i++ {
+		coder.debug = append(coder.debug, t.Field(i).Type.Name())
 		coder.fields = append(coder.fields, encoderForSingleTypeReflect(t.Field(i).Type))
 	}
 
@@ -304,7 +322,7 @@ func encoderForStructReflect(t reflect.Type) func(reflect.Value, io.Writer) erro
 				}
 			}
 			if err := f(rvf, w); err != nil {
-				return err
+				return errors.Wrapf(err, "encoding %v, expected: %v", rvf.Type(), coder.debug[i])
 			}
 		}
 		return nil

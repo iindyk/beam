@@ -292,6 +292,8 @@ class FnApiRunner(runner.PipelineRunner):
         phases=[
             translations.annotate_downstream_side_inputs,
             translations.fix_side_input_pcoll_coders,
+            translations.eliminate_common_key_with_none,
+            translations.pack_combiners,
             translations.lift_combiners,
             translations.expand_sdf,
             translations.expand_gbk,
@@ -305,7 +307,7 @@ class FnApiRunner(runner.PipelineRunner):
         ],
         known_runner_urns=frozenset([
             common_urns.primitives.FLATTEN.urn,
-            common_urns.primitives.GROUP_BY_KEY.urn
+            common_urns.primitives.GROUP_BY_KEY.urn,
         ]),
         use_state_iterables=self._use_state_iterables,
         is_drain=self._is_drain)
@@ -493,7 +495,16 @@ class FnApiRunner(runner.PipelineRunner):
     # We create the bundle manager here, as it can be reused for bundles of the
     # same stage, but it may have to be created by-bundle later on.
     cache_token_generator = FnApiRunner.get_cache_token_generator(static=False)
-    bundle_manager = ParallelBundleManager(
+    if bundle_context_manager.num_workers == 1:
+      # Avoid thread/processor pools for increased performance and debugability.
+      bundle_manager_type = BundleManager
+    elif bundle_context_manager.stage.is_stateful():
+      # State is keyed, and a single key cannot be processed concurrently.
+      # Alternatively, we could arrange to partition work by key.
+      bundle_manager_type = BundleManager
+    else:
+      bundle_manager_type = ParallelBundleManager
+    bundle_manager = bundle_manager_type(
         bundle_context_manager,
         self._progress_frequency,
         cache_token_generator=cache_token_generator)
@@ -782,12 +793,15 @@ class BundleManager(object):
         split_response = self._worker_handler.control_conn.push(
             split_request).get()  # type: beam_fn_api_pb2.InstructionResponse
         for t in (0.05, 0.1, 0.2):
-          waiting = ('Instruction not running', 'not yet scheduled')
-          if any(msg in split_response.error for msg in waiting):
+          if ('Unknown process bundle' in split_response.error or
+              split_response.process_bundle_split ==
+              beam_fn_api_pb2.ProcessBundleSplitResponse()):
             time.sleep(t)
             split_response = self._worker_handler.control_conn.push(
                 split_request).get()
-        if 'Unknown process bundle' in split_response.error:
+        if ('Unknown process bundle' in split_response.error or
+            split_response.process_bundle_split ==
+            beam_fn_api_pb2.ProcessBundleSplitResponse()):
           # It may have finished too fast.
           split_result = None
         elif split_response.error:
@@ -883,7 +897,10 @@ class BundleManager(object):
       finalize_request = beam_fn_api_pb2.InstructionRequest(
           finalize_bundle=beam_fn_api_pb2.FinalizeBundleRequest(
               instruction_id=process_bundle_id))
-      self._worker_handler.control_conn.push(finalize_request)
+      finalize_response = self._worker_handler.control_conn.push(
+          finalize_request).get()
+      if finalize_response.error:
+        raise RuntimeError(finalize_response.error)
 
     return result, split_results
 

@@ -238,10 +238,13 @@ import decimal
 import itertools
 import json
 import logging
+import random
+import threading
 import time
 import uuid
 from builtins import object
 from builtins import zip
+from typing import Optional
 
 from future.utils import itervalues
 from past.builtins import unicode
@@ -256,12 +259,15 @@ from apache_beam.io.filesystems import CompressionTypes
 from apache_beam.io.filesystems import FileSystems
 from apache_beam.io.gcp import bigquery_tools
 from apache_beam.io.gcp.bigquery_io_metadata import create_bigquery_io_metadata
+from apache_beam.io.gcp.bigquery_tools import RetryStrategy
 from apache_beam.io.gcp.internal.clients import bigquery
 from apache_beam.io.iobase import BoundedSource
 from apache_beam.io.iobase import RangeTracker
 from apache_beam.io.iobase import SourceBundle
 from apache_beam.io.textio import _TextSource as TextSource
+from apache_beam.metrics import Metrics
 from apache_beam.options import value_provider as vp
+from apache_beam.options.pipeline_options import BigQueryOptions
 from apache_beam.options.pipeline_options import DebugOptions
 from apache_beam.options.pipeline_options import GoogleCloudOptions
 from apache_beam.options.pipeline_options import StandardOptions
@@ -275,9 +281,12 @@ from apache_beam.transforms import PTransform
 from apache_beam.transforms.display import DisplayDataItem
 from apache_beam.transforms.sideinputs import SIDE_INPUT_PREFIX
 from apache_beam.transforms.sideinputs import get_sideinput_index
+from apache_beam.transforms.util import ReshufflePerKey
 from apache_beam.transforms.window import GlobalWindows
 from apache_beam.utils import retry
 from apache_beam.utils.annotations import deprecated
+from apache_beam.utils.histogram import Histogram
+from apache_beam.utils.histogram import LinearBucket
 
 __all__ = [
     'TableRowJsonCoder',
@@ -290,6 +299,22 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+"""
+Template for BigQuery jobs created by BigQueryIO. This template is:
+`"beam_bq_job_{job_type}_{job_id}_{step_id}_{random}"`, where:
+
+- `job_type` represents the BigQuery job type (e.g. extract / copy / load /
+    query).
+- `job_id` is the Beam job name.
+- `step_id` is a UUID representing the the Dataflow step that created the
+    BQ job.
+- `random` is a random string.
+
+NOTE: This job name template does not have backwards compatibility guarantees.
+"""
+BQ_JOB_NAME_TEMPLATE = "beam_bq_job_{job_type}_{job_id}_{step_id}{random}"
+"""The number of shards per destination when writing via streaming inserts."""
+DEFAULT_SHARDS_PER_DESTINATION = 500
 
 
 @deprecated(since='2.11.0', current="bigquery_tools.parse_table_reference")
@@ -402,7 +427,45 @@ class BigQueryDisposition(object):
 # BigQuerySource, BigQuerySink.
 
 
-class BigQuerySource(dataflow_io.NativeSource):
+@deprecated(since='2.25.0', current="ReadFromBigQuery")
+def BigQuerySource(
+    table=None,
+    dataset=None,
+    project=None,
+    query=None,
+    validate=False,
+    coder=None,
+    use_standard_sql=False,
+    flatten_results=True,
+    kms_key=None,
+    use_dataflow_native_source=False):
+  if use_dataflow_native_source:
+    return _BigQuerySource(
+        table,
+        dataset,
+        project,
+        query,
+        validate,
+        coder,
+        use_standard_sql,
+        flatten_results,
+        kms_key)
+  else:
+    return ReadFromBigQuery(
+        table=table,
+        dataset=dataset,
+        project=project,
+        query=query,
+        validate=validate,
+        coder=coder,
+        use_standard_sql=use_standard_sql,
+        flatten_results=flatten_results,
+        use_json_exports=True,
+        kms_key=kms_key)
+
+
+@deprecated(since='2.25.0', current="ReadFromBigQuery")
+class _BigQuerySource(dataflow_io.NativeSource):
   """A source based on a BigQuery table."""
   def __init__(
       self,
@@ -525,30 +588,31 @@ class BigQuerySource(dataflow_io.NativeSource):
         kms_key=self.kms_key)
 
 
-FieldSchema = collections.namedtuple('FieldSchema', 'fields mode name type')
-
-
-def _to_decimal(value):
-  return decimal.Decimal(value)
-
-
-def _to_bytes(value):
-  """Converts value from str to bytes on Python 3.x. Does nothing on
-  Python 2.7."""
-  return value.encode('utf-8')
-
-
 class _JsonToDictCoder(coders.Coder):
   """A coder for a JSON string to a Python dict."""
+
+  FieldSchema = collections.namedtuple('FieldSchema', 'fields mode name type')
+
   def __init__(self, table_schema):
     self.fields = self._convert_to_tuple(table_schema.fields)
     self._converters = {
         'INTEGER': int,
         'INT64': int,
         'FLOAT': float,
-        'NUMERIC': _to_decimal,
-        'BYTES': _to_bytes,
+        'FLOAT64': float,
+        'NUMERIC': self._to_decimal,
+        'BYTES': self._to_bytes,
     }
+
+  @staticmethod
+  def _to_decimal(value):
+    return decimal.Decimal(value)
+
+  @staticmethod
+  def _to_bytes(value):
+    """Converts value from str to bytes on Python 3.x. Does nothing on
+    Python 2.7."""
+    return value.encode('utf-8')
 
   @classmethod
   def _convert_to_tuple(cls, table_field_schemas):
@@ -560,7 +624,8 @@ class _JsonToDictCoder(coders.Coder):
       return []
 
     return [
-        FieldSchema(cls._convert_to_tuple(x.fields), x.mode, x.name, x.type)
+        cls.FieldSchema(
+            cls._convert_to_tuple(x.fields), x.mode, x.name, x.type)
         for x in table_field_schemas
     ]
 
@@ -578,8 +643,14 @@ class _JsonToDictCoder(coders.Coder):
         continue
 
       if field.type == 'RECORD':
-        value[field.name] = self._decode_with_schema(
-            value[field.name], field.fields)
+        nested_values = value[field.name]
+        if field.mode == 'REPEATED':
+          for i, nested_value in enumerate(nested_values):
+            nested_values[i] = self._decode_with_schema(
+                nested_value, field.fields)
+        else:
+          value[field.name] = self._decode_with_schema(
+              nested_values, field.fields)
       else:
         try:
           converter = self._converters[field.type]
@@ -611,7 +682,10 @@ class _CustomBigQuerySource(BoundedSource):
       flatten_results=True,
       kms_key=None,
       bigquery_job_labels=None,
-      use_json_exports=False):
+      use_json_exports=False,
+      job_name=None,
+      step_name=None,
+      unique_id=None):
     if table is not None and query is not None:
       raise ValueError(
           'Both a BigQuery table and a query were specified.'
@@ -642,6 +716,14 @@ class _CustomBigQuerySource(BoundedSource):
     self.bq_io_metadata = None  # Populate in setup, as it may make an RPC
     self.bigquery_job_labels = bigquery_job_labels or {}
     self.use_json_exports = use_json_exports
+    self._job_name = job_name or 'AUTOMATIC_JOB_NAME'
+    self._step_name = step_name
+    self._source_uuid = unique_id
+
+  def _get_bq_metadata(self):
+    if not self.bq_io_metadata:
+      self.bq_io_metadata = create_bigquery_io_metadata(self._step_name)
+    return self.bq_io_metadata
 
   def display_data(self):
     export_format = 'JSON' if self.use_json_exports else 'AVRO'
@@ -657,33 +739,38 @@ class _CustomBigQuerySource(BoundedSource):
     }
 
   def estimate_size(self):
-    if not self.bq_io_metadata:
-      self.bq_io_metadata = create_bigquery_io_metadata()
     bq = bigquery_tools.BigQueryWrapper()
     if self.table_reference is not None:
       table_ref = self.table_reference
       if (isinstance(self.table_reference, vp.ValueProvider) and
           self.table_reference.is_accessible()):
         table_ref = bigquery_tools.parse_table_reference(
-            self.table_reference.get(), self.dataset, self.project)
+            table_ref, project=self._get_project())
       elif isinstance(self.table_reference, vp.ValueProvider):
         # Size estimation is best effort. We return None as we have
         # no access to the table that we're querying.
         return None
+      if not table_ref.projectId:
+        table_ref.projectId = self._get_project()
       table = bq.get_table(
           table_ref.projectId, table_ref.datasetId, table_ref.tableId)
       return int(table.numBytes)
     elif self.query is not None and self.query.is_accessible():
       project = self._get_project()
+      query_job_name = bigquery_tools.generate_bq_job_name(
+          self._job_name,
+          self._source_uuid,
+          bigquery_tools.BigQueryJobTypes.QUERY,
+          random.randint(0, 1000))
       job = bq._start_query_job(
           project,
           self.query.get(),
           self.use_legacy_sql,
           self.flatten_results,
-          job_id=uuid.uuid4().hex,
+          job_id=query_job_name,
           dry_run=True,
           kms_key=self.kms_key,
-          job_labels=self.bq_io_metadata.add_additional_bq_job_labels(
+          job_labels=self._get_bq_metadata().add_additional_bq_job_labels(
               self.bigquery_job_labels))
       size = int(job.statistics.totalBytesProcessed)
       return size
@@ -721,6 +808,9 @@ class _CustomBigQuerySource(BoundedSource):
         self._setup_temporary_dataset(bq)
         self.table_reference = self._execute_query(bq)
 
+      if not self.table_reference.projectId:
+        self.table_reference.projectId = self._get_project()
+
       schema, metadata_list = self._export_files(bq)
       self.split_result = [
           self._create_source(metadata.path, schema)
@@ -755,16 +845,19 @@ class _CustomBigQuerySource(BoundedSource):
 
   @check_accessible(['query'])
   def _execute_query(self, bq):
-    if not self.bq_io_metadata:
-      self.bq_io_metadata = create_bigquery_io_metadata()
+    query_job_name = bigquery_tools.generate_bq_job_name(
+        self._job_name,
+        self._source_uuid,
+        bigquery_tools.BigQueryJobTypes.QUERY,
+        random.randint(0, 1000))
     job = bq._start_query_job(
         self._get_project(),
         self.query.get(),
         self.use_legacy_sql,
         self.flatten_results,
-        job_id=uuid.uuid4().hex,
+        job_id=query_job_name,
         kms_key=self.kms_key,
-        job_labels=self.bq_io_metadata.add_additional_bq_job_labels(
+        job_labels=self._get_bq_metadata().add_additional_bq_job_labels(
             self.bigquery_job_labels))
     job_ref = job.jobReference
     bq.wait_for_bq_job(job_ref, max_retries=0)
@@ -776,22 +869,27 @@ class _CustomBigQuerySource(BoundedSource):
     Returns:
       bigquery.TableSchema instance, a list of FileMetadata instances
     """
-    job_id = uuid.uuid4().hex
-    if not self.bq_io_metadata:
-      self.bq_io_metadata = create_bigquery_io_metadata()
-    job_labels = self.bq_io_metadata.add_additional_bq_job_labels(
+    job_labels = self._get_bq_metadata().add_additional_bq_job_labels(
         self.bigquery_job_labels)
+    export_job_name = bigquery_tools.generate_bq_job_name(
+        self._job_name,
+        self._source_uuid,
+        bigquery_tools.BigQueryJobTypes.EXPORT,
+        random.randint(0, 1000))
+    temp_location = self.options.view_as(GoogleCloudOptions).temp_location
+    gcs_location = ReadFromBigQuery.get_destination_uri(
+        self.gcs_location, temp_location, self._source_uuid)
     if self.use_json_exports:
-      job_ref = bq.perform_extract_job([self.gcs_location],
-                                       job_id,
+      job_ref = bq.perform_extract_job([gcs_location],
+                                       export_job_name,
                                        self.table_reference,
                                        bigquery_tools.FileFormat.JSON,
                                        project=self._get_project(),
                                        job_labels=job_labels,
                                        include_header=False)
     else:
-      job_ref = bq.perform_extract_job([self.gcs_location],
-                                       job_id,
+      job_ref = bq.perform_extract_job([gcs_location],
+                                       export_job_name,
                                        self.table_reference,
                                        bigquery_tools.FileFormat.AVRO,
                                        project=self._get_project(),
@@ -799,11 +897,11 @@ class _CustomBigQuerySource(BoundedSource):
                                        job_labels=job_labels,
                                        use_avro_logical_types=True)
     bq.wait_for_bq_job(job_ref)
-    metadata_list = FileSystems.match([self.gcs_location])[0].metadata_list
+    metadata_list = FileSystems.match([gcs_location])[0].metadata_list
 
     if isinstance(self.table_reference, vp.ValueProvider):
       table_ref = bigquery_tools.parse_table_reference(
-          self.table_reference.get(), self.dataset, self.project)
+          self.table_reference.get(), project=self.project)
     else:
       table_ref = self.table_reference
     table = bq.get_table(
@@ -988,6 +1086,9 @@ class BigQueryWriteFn(DoFn):
   DEFAULT_MAX_BATCH_SIZE = 500
 
   FAILED_ROWS = 'FailedRows'
+  LATENCY_LOGGING_HISTOGRAM = Histogram(LinearBucket(0, 20, 3000))
+  LATENCY_LOGGING_LAST_REPORTED_MILLIS = int(time.time() * 1000)
+  LATENCY_LOGGING_LOCK = threading.Lock()
 
   def __init__(
       self,
@@ -999,7 +1100,9 @@ class BigQueryWriteFn(DoFn):
       test_client=None,
       max_buffered_rows=None,
       retry_strategy=None,
-      additional_bq_parameters=None):
+      additional_bq_parameters=None,
+      ignore_insert_ids=False,
+      latency_logging_frequency_sec=None):
     """Initialize a WriteToBigQuery transform.
 
     Args:
@@ -1034,6 +1137,14 @@ class BigQueryWriteFn(DoFn):
         to be passed when creating a BigQuery table. These are passed when
         triggering a load job for FILE_LOADS, and when creating a new table for
         STREAMING_INSERTS.
+      ignore_insert_ids: When using the STREAMING_INSERTS method to write data
+        to BigQuery, `insert_ids` are a feature of BigQuery that support
+        deduplication of events. If your use case is not sensitive to
+        duplication of data inserted to BigQuery, set `ignore_insert_ids`
+        to True to increase the throughput for BQ writing. See:
+        https://cloud.google.com/bigquery/streaming-data-into-bigquery#disabling_best_effort_de-duplication
+      latency_logging_frequency_sec: The frequency in seconds that the logger
+        prints out streaming insert API latency percentile information.
     """
     self.schema = schema
     self.test_client = test_client
@@ -1047,10 +1158,22 @@ class BigQueryWriteFn(DoFn):
     self._max_batch_size = batch_size or BigQueryWriteFn.DEFAULT_MAX_BATCH_SIZE
     self._max_buffered_rows = (
         max_buffered_rows or BigQueryWriteFn.DEFAULT_MAX_BUFFERED_ROWS)
-    self._retry_strategy = (
-        retry_strategy or bigquery_tools.RetryStrategy.RETRY_ALWAYS)
+    self._retry_strategy = retry_strategy or RetryStrategy.RETRY_ALWAYS
+    self.ignore_insert_ids = ignore_insert_ids
 
     self.additional_bq_parameters = additional_bq_parameters or {}
+
+    # accumulate the total time spent in exponential backoff
+    self._throttled_secs = Metrics.counter(
+        BigQueryWriteFn, "cumulativeThrottlingSeconds")
+    self.batch_size_metric = Metrics.distribution(self.__class__, "batch_size")
+    self.batch_latency_metric = Metrics.distribution(
+        self.__class__, "batch_latency_ms")
+    self.failed_rows_metric = Metrics.distribution(
+        self.__class__, "rows_failed_per_batch")
+    self.bigquery_wrapper = None
+    self._latency_logging_frequency_msec = (
+        latency_logging_frequency_sec or 180) * 1000
 
   def display_data(self):
     return {
@@ -1059,7 +1182,8 @@ class BigQueryWriteFn(DoFn):
         'retry_strategy': self._retry_strategy,
         'create_disposition': str(self.create_disposition),
         'write_disposition': str(self.write_disposition),
-        'additional_bq_parameters': str(self.additional_bq_parameters)
+        'additional_bq_parameters': str(self.additional_bq_parameters),
+        'ignore_insert_ids': str(self.ignore_insert_ids)
     }
 
   def _reset_rows_buffer(self):
@@ -1089,8 +1213,9 @@ class BigQueryWriteFn(DoFn):
   def start_bundle(self):
     self._reset_rows_buffer()
 
-    self.bigquery_wrapper = bigquery_tools.BigQueryWrapper(
-        client=self.test_client)
+    if not self.bigquery_wrapper:
+      self.bigquery_wrapper = bigquery_tools.BigQueryWrapper(
+          client=self.test_client)
 
     self._backoff_calculator = iter(
         retry.FuzzedExponentialIntervals(
@@ -1151,6 +1276,20 @@ class BigQueryWriteFn(DoFn):
       return self._flush_all_batches()
 
   def finish_bundle(self):
+    if BigQueryWriteFn.LATENCY_LOGGING_LOCK.acquire(False):
+      try:
+        current_millis = int(time.time() * 1000)
+        if (BigQueryWriteFn.LATENCY_LOGGING_HISTOGRAM.total_count() > 0 and
+            (current_millis -
+             BigQueryWriteFn.LATENCY_LOGGING_LAST_REPORTED_MILLIS) >
+            self._latency_logging_frequency_msec):
+          _LOGGER.info(
+              BigQueryWriteFn.LATENCY_LOGGING_HISTOGRAM.get_percentile_info(
+                  'streaming insert requests', 'ms'))
+          BigQueryWriteFn.LATENCY_LOGGING_HISTOGRAM.clear()
+          BigQueryWriteFn.LATENCY_LOGGING_LAST_REPORTED_MILLIS = current_millis
+      finally:
+        BigQueryWriteFn.LATENCY_LOGGING_LOCK.release()
     return self._flush_all_batches()
 
   def _flush_all_batches(self):
@@ -1179,24 +1318,32 @@ class BigQueryWriteFn(DoFn):
         'Flushing data to %s. Total %s rows.',
         destination,
         len(rows_and_insert_ids))
+    self.batch_size_metric.update(len(rows_and_insert_ids))
 
     rows = [r[0] for r in rows_and_insert_ids]
-    insert_ids = [r[1] for r in rows_and_insert_ids]
+    if self.ignore_insert_ids:
+      insert_ids = None
+    else:
+      insert_ids = [r[1] for r in rows_and_insert_ids]
 
     while True:
+      start = time.time()
       passed, errors = self.bigquery_wrapper.insert_rows(
           project_id=table_reference.projectId,
           dataset_id=table_reference.datasetId,
           table_id=table_reference.tableId,
           rows=rows,
           insert_ids=insert_ids,
-          skip_invalid_rows=True)
+          skip_invalid_rows=True,
+          latency_recoder=BigQueryWriteFn.LATENCY_LOGGING_HISTOGRAM)
+      self.batch_latency_metric.update((time.time() - start) * 1000)
 
       failed_rows = [rows[entry.index] for entry in errors]
       should_retry = any(
-          bigquery_tools.RetryStrategy.should_retry(
+          RetryStrategy.should_retry(
               self._retry_strategy, entry.errors[0].reason) for entry in errors)
       if not passed:
+        self.failed_rows_metric.update(len(failed_rows))
         message = (
             'There were errors inserting to BigQuery. Will{} retry. '
             'Errors were {}'.format(("" if should_retry else " not"), errors))
@@ -1214,6 +1361,7 @@ class BigQueryWriteFn(DoFn):
         _LOGGER.info(
             'Sleeping %s seconds before retrying insertion.', retry_backoff)
         time.sleep(retry_backoff)
+        self._throttled_secs.inc(retry_backoff)
 
     self._total_buffered_rows -= len(self._rows_buffer[destination])
     del self._rows_buffer[destination]
@@ -1239,6 +1387,8 @@ class _StreamToBigQuery(PTransform):
       kms_key,
       retry_strategy,
       additional_bq_parameters,
+      ignore_insert_ids,
+      latency_logging_frequency_sec,
       test_client=None):
     self.table_reference = table_reference
     self.table_side_inputs = table_side_inputs
@@ -1251,8 +1401,13 @@ class _StreamToBigQuery(PTransform):
     self.retry_strategy = retry_strategy
     self.test_client = test_client
     self.additional_bq_parameters = additional_bq_parameters
+    self.ignore_insert_ids = ignore_insert_ids
+    self.latency_logging_frequency_sec = latency_logging_frequency_sec
 
   class InsertIdPrefixFn(DoFn):
+    def __init__(self, shards=DEFAULT_SHARDS_PER_DESTINATION):
+      self.shards = shards
+
     def start_bundle(self):
       self.prefix = str(uuid.uuid4())
       self._row_count = 0
@@ -1260,6 +1415,7 @@ class _StreamToBigQuery(PTransform):
     def process(self, element):
       key = element[0]
       value = element[1]
+      key = (key, random.randint(0, self.shards))
 
       insert_id = '%s-%s' % (self.prefix, self._row_count)
       self._row_count += 1
@@ -1274,15 +1430,30 @@ class _StreamToBigQuery(PTransform):
         kms_key=self.kms_key,
         retry_strategy=self.retry_strategy,
         test_client=self.test_client,
-        additional_bq_parameters=self.additional_bq_parameters)
+        additional_bq_parameters=self.additional_bq_parameters,
+        ignore_insert_ids=self.ignore_insert_ids,
+        latency_logging_frequency_sec=self.latency_logging_frequency_sec)
 
-    return (
+    def drop_shard(elms):
+      key_and_shard = elms[0]
+      key = key_and_shard[0]
+      value = elms[1]
+      return (key, value)
+
+    sharded_data = (
         input
         | 'AppendDestination' >> beam.ParDo(
             bigquery_tools.AppendDestinationsFn(self.table_reference),
             *self.table_side_inputs)
-        | 'AddInsertIds' >> beam.ParDo(_StreamToBigQuery.InsertIdPrefixFn())
-        | 'CommitInsertIds' >> beam.Reshuffle()
+        | 'AddInsertIdsWithRandomKeys' >> beam.ParDo(
+            _StreamToBigQuery.InsertIdPrefixFn()))
+
+    if not self.ignore_insert_ids:
+      sharded_data = (sharded_data | 'CommitInsertIds' >> ReshufflePerKey())
+
+    return (
+        sharded_data
+        | 'DropShard' >> beam.Map(drop_shard)
         | 'StreamInsertRows' >> ParDo(
             bigquery_write_fn, *self.schema_side_inputs).with_outputs(
                 BigQueryWriteFn.FAILED_ROWS, main='main'))
@@ -1325,7 +1496,8 @@ class WriteToBigQuery(PTransform):
       schema_side_inputs=None,
       triggering_frequency=None,
       validate=True,
-      temp_file_format=None):
+      temp_file_format=None,
+      ignore_insert_ids=False):
     """Initialize a WriteToBigQuery transform.
 
     Args:
@@ -1405,7 +1577,18 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
         Default is to retry always. This means that whenever there are rows
         that fail to be inserted to BigQuery, they will be retried indefinitely.
         Other retry strategy settings will produce a deadletter PCollection
-        as output.
+        as output. Appropriate values are:
+
+        * `RetryStrategy.RETRY_ALWAYS`: retry all rows if
+          there are any kind of errors. Note that this will hold your pipeline
+          back if there are errors until you cancel or update it.
+        * `RetryStrategy.RETRY_NEVER`: rows with errors
+          will not be retried. Instead they will be output to a dead letter
+          queue under the `'FailedRows'` tag.
+        * `RetryStrategy.RETRY_ON_TRANSIENT_ERROR`: retry
+          rows with transient errors (e.g. timeouts). Rows with permanent errors
+          will be output to dead letter queue under `'FailedRows'` tag.
+
       additional_bq_parameters (callable): A function that returns a dictionary
         with additional parameters to pass to BQ when creating / loading data
         into a table. These can be 'timePartitioning', 'clustering', etc. They
@@ -1432,6 +1615,12 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
         https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-avro
         and
         https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json.
+      ignore_insert_ids: When using the STREAMING_INSERTS method to write data
+        to BigQuery, `insert_ids` are a feature of BigQuery that support
+        deduplication of events. If your use case is not sensitive to
+        duplication of data inserted to BigQuery, set `ignore_insert_ids`
+        to True to increase the throughput for BQ writing. See:
+        https://cloud.google.com/bigquery/streaming-data-into-bigquery#disabling_best_effort_de-duplication
     """
     self._table = table
     self._dataset = dataset
@@ -1463,6 +1652,7 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
     self.additional_bq_parameters = additional_bq_parameters or {}
     self.table_side_inputs = table_side_inputs or ()
     self.schema_side_inputs = schema_side_inputs or ()
+    self._ignore_insert_ids = ignore_insert_ids
 
   # Dict/schema methods were moved to bigquery_tools, but keep references
   # here for backward compatibility.
@@ -1474,9 +1664,7 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
   def _compute_method(self, experiments, is_streaming_pipeline):
     # If the new BQ sink is not activated for experiment flags, then we use
     # streaming inserts by default (it gets overridden in dataflow_runner.py).
-    if 'use_beam_bq_sink' not in experiments:
-      return self.Method.STREAMING_INSERTS
-    elif self.method == self.Method.DEFAULT and is_streaming_pipeline:
+    if self.method == self.Method.DEFAULT and is_streaming_pipeline:
       return self.Method.STREAMING_INSERTS
     elif self.method == self.Method.DEFAULT and not is_streaming_pipeline:
       return self.Method.FILE_LOADS
@@ -1494,6 +1682,8 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
     experiments = p.options.view_as(DebugOptions).experiments or []
     # TODO(pabloem): Use a different method to determine if streaming or batch.
     is_streaming_pipeline = p.options.view_as(StandardOptions).streaming
+    latency_logging_frequency_sec = p.options.view_as(
+        BigQueryOptions).latency_logging_frequency_sec
 
     method_to_use = self._compute_method(experiments, is_streaming_pipeline)
 
@@ -1519,6 +1709,8 @@ bigquery_v2_messages.TableSchema`. or a `ValueProvider` that has a JSON string,
           self.kms_key,
           self.insert_retry_strategy,
           self.additional_bq_parameters,
+          self._ignore_insert_ids,
+          latency_logging_frequency_sec,
           test_client=self.test_client)
 
       return {BigQueryWriteFn.FAILED_ROWS: outputs[BigQueryWriteFn.FAILED_ROWS]}
@@ -1723,7 +1915,9 @@ class ReadFromBigQuery(PTransform):
       https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-avro\
               #avro_conversions
    """
-  def __init__(self, gcs_location=None, validate=False, *args, **kwargs):
+  COUNTER = 0
+
+  def __init__(self, gcs_location=None, *args, **kwargs):
     if gcs_location:
       if not isinstance(gcs_location, (str, unicode, ValueProvider)):
         raise TypeError(
@@ -1735,61 +1929,73 @@ class ReadFromBigQuery(PTransform):
         gcs_location = StaticValueProvider(str, gcs_location)
 
     self.gcs_location = gcs_location
-    self.validate = validate
 
     self._args = args
     self._kwargs = kwargs
 
-  def _get_destination_uri(self, temp_location):
+  @staticmethod
+  def get_destination_uri(
+      gcs_location_vp,  # type: Optional[ValueProvider]
+      temp_location,  # type: Optional[str]
+      unique_id,  # type: str
+  ):
     """Returns the fully qualified Google Cloud Storage URI where the
     extracted table should be written.
     """
     file_pattern = 'bigquery-table-dump-*.json'
 
-    if self.gcs_location is not None:
-      gcs_base = self.gcs_location.get()
+    gcs_location = None
+    if gcs_location_vp is not None:
+      gcs_location = gcs_location_vp.get()
+
+    if gcs_location is not None:
+      gcs_base = gcs_location
     elif temp_location is not None:
       gcs_base = temp_location
-      logging.debug("gcs_location is empty, using temp_location instead")
+      _LOGGER.debug("gcs_location is empty, using temp_location instead")
     else:
       raise ValueError(
-          '{} requires a GCS location to be provided. Neither gcs_location in'
-          ' the constructor nor the fallback option --temp_location is set.'.
-          format(self.__class__.__name__))
-    if self.validate:
-      self._validate_gcs_location(gcs_base)
+          'ReadFromBigQuery requires a GCS location to be provided. Neither '
+          'gcs_location in the constructor nor the fallback option '
+          '--temp_location is set.')
 
-    job_id = uuid.uuid4().hex
-    return FileSystems.join(gcs_base, job_id, file_pattern)
-
-  @staticmethod
-  def _validate_gcs_location(gcs_location):
-    if not gcs_location.startswith('gs://'):
-      raise ValueError('Invalid GCS location: {}'.format(gcs_location))
+    return FileSystems.join(gcs_base, unique_id, file_pattern)
 
   def expand(self, pcoll):
-    class RemoveJsonFiles(beam.DoFn):
-      def __init__(self, gcs_location):
-        self._gcs_location = gcs_location
+    class RemoveExportedFiles(beam.DoFn):
+      def __init__(self, gcs_location_vp):
+        self._gcs_location_vp = gcs_location_vp
+        self._temp_location = temp_location
+        self._unique_id = unique_id
 
       def process(self, unused_element, signal):
-        match_result = FileSystems.match([self._gcs_location])[0].metadata_list
-        logging.debug(
+        gcs_location = ReadFromBigQuery.get_destination_uri(
+            self._gcs_location_vp, self._temp_location, self._unique_id)
+        match_result = FileSystems.match([gcs_location])[0].metadata_list
+        _LOGGER.debug(
             "%s: matched %s files", self.__class__.__name__, len(match_result))
         paths = [x.path for x in match_result]
         FileSystems.delete(paths)
 
+    unique_id = str(uuid.uuid4())[0:10]
     temp_location = pcoll.pipeline.options.view_as(
         GoogleCloudOptions).temp_location
-    gcs_location = self._get_destination_uri(temp_location)
+    job_name = pcoll.pipeline.options.view_as(GoogleCloudOptions).job_name
 
+    try:
+      step_name = self.label
+    except AttributeError:
+      step_name = 'ReadFromBigQuery_%d' % ReadFromBigQuery.COUNTER
+      ReadFromBigQuery.COUNTER += 1
     return (
         pcoll
         | beam.io.Read(
             _CustomBigQuerySource(
-                gcs_location=gcs_location,
-                validate=self.validate,
+                gcs_location=self.gcs_location,
                 pipeline_options=pcoll.pipeline.options,
+                job_name=job_name,
+                step_name=step_name,
+                unique_id=unique_id,
                 *self._args,
                 **self._kwargs))
-        | _PassThroughThenCleanup(RemoveJsonFiles(gcs_location)))
+        | _PassThroughThenCleanup(RemoveExportedFiles(self.gcs_location)))

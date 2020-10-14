@@ -156,7 +156,8 @@ public class SplittableDoFnOperator<InputT, OutputT, RestrictionT>
                 sideInputReader,
                 executorService,
                 10000,
-                Duration.standardSeconds(10)));
+                Duration.standardSeconds(10),
+                this::getBundleFinalizer));
   }
 
   @Override

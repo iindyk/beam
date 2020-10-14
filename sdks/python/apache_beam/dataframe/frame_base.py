@@ -16,7 +16,9 @@
 
 from __future__ import absolute_import
 
+import functools
 import inspect
+import sys
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -28,6 +30,18 @@ import pandas as pd
 
 from apache_beam.dataframe import expressions
 from apache_beam.dataframe import partitionings
+
+# pylint: disable=deprecated-method
+if sys.version_info < (3, ):
+  _getargspec = inspect.getargspec
+
+  def _unwrap(func):
+    while hasattr(func, '__wrapped__'):
+      func = func.__wrapped__
+    return func
+else:
+  _getargspec = inspect.getfullargspec
+  _unwrap = inspect.unwrap
 
 
 class DeferredBase(object):
@@ -53,13 +67,30 @@ class DeferredBase(object):
     else:
       if expr.requires_partition_by() != partitionings.Singleton():
         raise ValueError(
-            'Scalar expression %s partitoned by non-singleton %s' %
-            (expr, expr.requires_partition_by()))
+            'Scalar expression %s of type %s partitoned by non-singleton %s' %
+            (expr, proxy_type, expr.requires_partition_by()))
       wrapper_type = _DeferredScalar
     return wrapper_type(expr)
 
   def _elementwise(self, func, name=None, other_args=(), inplace=False):
     return _elementwise_function(func, name, inplace=inplace)(self, *other_args)
+
+  def __reduce__(self):
+    return UnusableUnpickledDeferredBase, (str(self), )
+
+
+class UnusableUnpickledDeferredBase(object):
+  """Placeholder object used to break the transitive pickling chain in case a
+  DeferredBase accidentially gets pickled (e.g. as part of globals).
+
+  Trying to use this object after unpickling is a bug and will result in an
+  error.
+  """
+  def __init__(self, name):
+    self._name = name
+
+  def __repr__(self):
+    return 'UnusablePickledDeferredBase(%r)' % self.name
 
 
 class DeferredFrame(DeferredBase):
@@ -69,7 +100,16 @@ class DeferredFrame(DeferredBase):
 
 
 class _DeferredScalar(DeferredBase):
-  pass
+  def apply(self, func, name=None, args=()):
+    if name is None:
+      name = func.__name__
+    with expressions.allow_non_parallel_operations(
+        all(isinstance(arg, _DeferredScalar) for arg in args) or None):
+      return DeferredFrame.wrap(
+          expressions.ComputedExpression(
+              name,
+              func, [self._expr] + [arg._expr for arg in args],
+              requires_partition_by=partitionings.Singleton()))
 
 
 DeferredBase._pandas_type_map[None] = _DeferredScalar
@@ -126,7 +166,7 @@ def _elementwise_function(func, name=None, restrictions=None, inplace=False):
 def _proxy_function(
       func,  # type: Union[Callable, str]
       name=None,  # type: Optional[str]
-      restrictions=None,  # type: Optional[Dict[str, Union[Any, List[Any]]]]
+      restrictions=None,  # type: Optional[Dict[str, Union[Any, List[Any], Callable[[Any], bool]]]]
       inplace=False,  # type: bool
       requires_partition_by=partitionings.Singleton(),  # type: partitionings.Partitioning
       preserves_partition_by=partitionings.Nothing(),  # type: partitionings.Partitioning
@@ -141,22 +181,26 @@ def _proxy_function(
     restrictions = {}
 
   def wrapper(*args, **kwargs):
-    for key, values in ():  #restrictions.items():
+    for key, values in restrictions.items():
       if key in kwargs:
         value = kwargs[key]
       else:
         try:
-          # pylint: disable=deprecated-method
-          ix = inspect.getargspec(func).args.index(key)
+          ix = _getargspec(func).args.index(key)
         except ValueError:
           # TODO: fix for delegation?
           continue
         if len(args) <= ix:
           continue
         value = args[ix]
-      if not isinstance(values, list):
-        values = [values]
-      if value not in values:
+      if callable(values):
+        check = values
+      elif isinstance(values, list):
+        check = lambda x, values=values: x in values
+      else:
+        check = lambda x, value=value: x == value
+
+      if not check(value):
         raise NotImplementedError(
             '%s=%s not supported for %s' % (key, value, name))
     deferred_arg_indices = []
@@ -183,11 +227,20 @@ def _proxy_function(
         full_args[ix] = arg
       return actual_func(*full_args, **kwargs)
 
+    if any(isinstance(arg.proxy(), pd.core.generic.NDFrame)
+           for arg in deferred_arg_exprs
+           ) and not requires_partition_by.is_subpartitioning_of(
+               partitionings.Index()):
+      # Implicit join on index.
+      actual_requires_partition_by = partitionings.Index()
+    else:
+      actual_requires_partition_by = requires_partition_by
+
     result_expr = expressions.ComputedExpression(
         name,
         apply,
         deferred_arg_exprs,
-        requires_partition_by=requires_partition_by,
+        requires_partition_by=actual_requires_partition_by,
         preserves_partition_by=preserves_partition_by)
     if inplace:
       args[0]._expr = result_expr
@@ -205,14 +258,16 @@ def _agg_method(func):
   return wrapper
 
 
-def _associative_agg_method(func):
-  # TODO(robertwb): Multi-level agg.
-  return _agg_method(func)
-
-
 def wont_implement_method(msg):
   def wrapper(self, *args, **kwargs):
     raise WontImplementError(msg)
+
+  return wrapper
+
+
+def not_implemented_method(op, jira='BEAM-9547'):
+  def wrapper(self, *args, **kwargs):
+    raise NotImplementedError("'%s' is not yet supported (%s)" % (op, jira))
 
   return wrapper
 
@@ -224,6 +279,68 @@ def copy_and_mutate(func):
     return copy
 
   return wrapper
+
+
+def maybe_inplace(func):
+  @functools.wraps(func)
+  def wrapper(self, inplace=False, **kwargs):
+    result = func(self, **kwargs)
+    if inplace:
+      self._expr = result._expr
+    else:
+      return result
+
+  return wrapper
+
+
+def args_to_kwargs(base_type):
+  def wrap(func):
+    arg_names = _getargspec(_unwrap(getattr(base_type, func.__name__))).args
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      for name, value in zip(arg_names, args):
+        if name in kwargs:
+          raise TypeError(
+              "%s() got multiple values for argument '%s'" %
+              (func.__name__, name))
+        kwargs[name] = value
+      return func(**kwargs)
+
+    return wrapper
+
+  return wrap
+
+
+def populate_defaults(base_type):
+  def wrap(func):
+    base_argspec = _getargspec(_unwrap(getattr(base_type, func.__name__)))
+    if not base_argspec.defaults:
+      return func
+
+    arg_to_default = dict(
+        zip(
+            base_argspec.args[-len(base_argspec.defaults):],
+            base_argspec.defaults))
+
+    unwrapped_func = _unwrap(func)
+    # args that do not have defaults in func, but do have defaults in base
+    func_argspec = _getargspec(unwrapped_func)
+    num_non_defaults = len(func_argspec.args) - len(func_argspec.defaults or ())
+    defaults_to_populate = set(
+        func_argspec.args[:num_non_defaults]).intersection(
+            arg_to_default.keys())
+
+    @functools.wraps(func)
+    def wrapper(**kwargs):
+      for name in defaults_to_populate:
+        if name not in kwargs:
+          kwargs[name] = arg_to_default[name]
+      return func(**kwargs)
+
+    return wrapper
+
+  return wrap
 
 
 class WontImplementError(NotImplementedError):

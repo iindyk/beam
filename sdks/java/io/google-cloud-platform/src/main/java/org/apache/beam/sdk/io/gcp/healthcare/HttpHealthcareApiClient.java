@@ -27,14 +27,19 @@ import com.google.api.services.healthcare.v1beta1.CloudHealthcare;
 import com.google.api.services.healthcare.v1beta1.CloudHealthcare.Projects.Locations.Datasets.Hl7V2Stores.Messages;
 import com.google.api.services.healthcare.v1beta1.CloudHealthcareScopes;
 import com.google.api.services.healthcare.v1beta1.model.CreateMessageRequest;
+import com.google.api.services.healthcare.v1beta1.model.DeidentifyConfig;
+import com.google.api.services.healthcare.v1beta1.model.DeidentifyFhirStoreRequest;
 import com.google.api.services.healthcare.v1beta1.model.Empty;
+import com.google.api.services.healthcare.v1beta1.model.ExportResourcesRequest;
 import com.google.api.services.healthcare.v1beta1.model.FhirStore;
+import com.google.api.services.healthcare.v1beta1.model.GoogleCloudHealthcareV1beta1FhirRestGcsDestination;
 import com.google.api.services.healthcare.v1beta1.model.GoogleCloudHealthcareV1beta1FhirRestGcsSource;
 import com.google.api.services.healthcare.v1beta1.model.Hl7V2Store;
 import com.google.api.services.healthcare.v1beta1.model.HttpBody;
 import com.google.api.services.healthcare.v1beta1.model.ImportResourcesRequest;
 import com.google.api.services.healthcare.v1beta1.model.IngestMessageRequest;
 import com.google.api.services.healthcare.v1beta1.model.IngestMessageResponse;
+import com.google.api.services.healthcare.v1beta1.model.ListFhirStoresResponse;
 import com.google.api.services.healthcare.v1beta1.model.ListMessagesResponse;
 import com.google.api.services.healthcare.v1beta1.model.Message;
 import com.google.api.services.healthcare.v1beta1.model.NotificationConfig;
@@ -154,6 +159,31 @@ public class HttpHealthcareApiClient implements HealthcareApiClient, Serializabl
         .create(dataset, store)
         .setFhirStoreId(name)
         .execute();
+  }
+
+  @Override
+  public List<FhirStore> listAllFhirStores(String dataset) throws IOException {
+    ArrayList<FhirStore> fhirStores = new ArrayList<>();
+    String pageToken = "";
+    do {
+      ListFhirStoresResponse resp =
+          client
+              .projects()
+              .locations()
+              .datasets()
+              .fhirStores()
+              .list(dataset)
+              .setPageToken(pageToken)
+              .execute();
+      for (FhirStore fs : resp.getFhirStores()) {
+        fhirStores.add(fs);
+      }
+      if (resp.getNextPageToken() == null) {
+        break;
+      }
+      pageToken = resp.getNextPageToken();
+    } while (!pageToken.equals(""));
+    return fhirStores;
   }
 
   @Override
@@ -380,6 +410,40 @@ public class HttpHealthcareApiClient implements HealthcareApiClient, Serializabl
         .datasets()
         .fhirStores()
         .healthcareImport(fhirStore, importRequest)
+        .execute();
+  }
+
+  @Override
+  public Operation exportFhirResourceToGcs(String fhirStore, String gcsDestinationPrefix)
+      throws IOException {
+    GoogleCloudHealthcareV1beta1FhirRestGcsDestination gcsDst =
+        new GoogleCloudHealthcareV1beta1FhirRestGcsDestination();
+
+    gcsDst.setUriPrefix(gcsDestinationPrefix);
+    ExportResourcesRequest exportRequest = new ExportResourcesRequest();
+    exportRequest.setGcsDestination(gcsDst);
+    return client
+        .projects()
+        .locations()
+        .datasets()
+        .fhirStores()
+        .export(fhirStore, exportRequest)
+        .execute();
+  }
+
+  @Override
+  public Operation deidentifyFhirStore(
+      String sourcefhirStore, String destinationFhirStore, DeidentifyConfig deidConfig)
+      throws IOException {
+    DeidentifyFhirStoreRequest deidRequest = new DeidentifyFhirStoreRequest();
+    deidRequest.setDestinationStore(destinationFhirStore);
+    deidRequest.setConfig(deidConfig);
+    return client
+        .projects()
+        .locations()
+        .datasets()
+        .fhirStores()
+        .deidentify(sourcefhirStore, deidRequest)
         .execute();
   }
 
