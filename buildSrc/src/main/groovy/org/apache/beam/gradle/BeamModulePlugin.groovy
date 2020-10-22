@@ -96,7 +96,7 @@ class BeamModulePlugin implements Plugin<Project> {
     boolean enableStrictDependencies = false
 
     /** Override the default "beam-" + `dash separated path` archivesBaseName. */
-    String archivesBaseName = null;
+    String archivesBaseName = null
 
     /**
      * List of additional lint warnings to disable.
@@ -131,7 +131,7 @@ class BeamModulePlugin implements Plugin<Project> {
      *
      * The shadowJar / shadowTestJar tasks execute the specified closure to configure themselves.
      */
-    Closure shadowClosure;
+    Closure shadowClosure
 
     /** Controls whether this project is published to Maven. */
     boolean publish = true
@@ -150,7 +150,7 @@ class BeamModulePlugin implements Plugin<Project> {
     /**
      * The set of additional maven repositories that should be added into published POM file.
      */
-    List<Map> mavenRepositories = [];
+    List<Map> mavenRepositories = []
   }
 
   /** A class defining the set of configurable properties accepted by applyPortabilityNature. */
@@ -164,7 +164,7 @@ class BeamModulePlugin implements Plugin<Project> {
     List<String> shadowJarValidationExcludes = ["org/apache/beam/**"]
 
     /** Override the default "beam-" + `dash separated path` archivesBaseName. */
-    String archivesBaseName = null;
+    String archivesBaseName = null
 
     /** Controls whether this project is published to Maven. */
     boolean publish = true
@@ -389,7 +389,7 @@ class BeamModulePlugin implements Plugin<Project> {
     def aws_java_sdk_version = "1.11.718"
     def aws_java_sdk2_version = "2.13.54"
     def cassandra_driver_version = "3.10.2"
-    def checkerframework_version = "3.5.0"
+    def checkerframework_version = "3.7.0"
     def classgraph_version = "4.8.65"
     def gax_version = "1.57.1"
     def generated_grpc_ga_version = "1.85.1"
@@ -397,7 +397,7 @@ class BeamModulePlugin implements Plugin<Project> {
     def google_clients_version = "1.30.10"
     def google_cloud_bigdataoss_version = "2.1.5"
     def google_cloud_core_version = "1.93.7"
-    def google_cloud_pubsublite_version = "0.1.6"
+    def google_cloud_pubsublite_version = "0.4.1"
     def google_cloud_spanner_version = "1.59.0"
     def google_cloud_datacatalog_version = "0.32.1"
     def google_code_gson_version = "2.8.6"
@@ -413,7 +413,7 @@ class BeamModulePlugin implements Plugin<Project> {
     def kafka_version = "1.0.0"
     def nemo_version = "0.1"
     def netty_version = "4.1.51.Final"
-    def postgres_version = "42.2.2"
+    def postgres_version = "42.2.16"
     def powermock_version = "2.0.2"
     def proto_google_common_protos_version = "1.17.0"
     def protobuf_version = "3.11.1"
@@ -575,6 +575,7 @@ class BeamModulePlugin implements Plugin<Project> {
         testcontainers_clickhouse                   : "org.testcontainers:clickhouse:$testcontainers_version",
         testcontainers_kafka                        : "org.testcontainers:kafka:$testcontainers_version",
         testcontainers_localstack                   : "org.testcontainers:localstack:$testcontainers_version",
+        testcontainers_elasticsearch                : "org.testcontainers:elasticsearch:$testcontainers_version",
         vendored_bytebuddy_1_10_8                   : "org.apache.beam:beam-vendor-bytebuddy-1_10_8:0.1",
         vendored_grpc_1_26_0                        : "org.apache.beam:beam-vendor-grpc-1_26_0:0.3",
         vendored_guava_26_0_jre                     : "org.apache.beam:beam-vendor-guava-26_0-jre:0.1",
@@ -1956,10 +1957,9 @@ class BeamModulePlugin implements Plugin<Project> {
 
       // Python interpreter version for virtualenv setup and test run. This value can be
       // set from commandline with -PpythonVersion, or in build script of certain project.
-      // If none of them applied, version set here will be used as default value. Currently
-      // the minimum version supported by Beam is 3.6
+      // If none of them applied, version set here will be used as default value.
       project.ext.pythonVersion = project.hasProperty('pythonVersion') ?
-          project.pythonVersion : '3.6'
+          project.pythonVersion : '3.8'
 
       project.task('setupVirtualenv')  {
         doLast {
